@@ -13,7 +13,63 @@ planner; it is not a robot controller or a leak sensor.
 | Map routing | `route.py` | Builds the rack map and uses breadth-first search (BFS) to find shortest four-direction paths around blocked tiles. |
 | Tile coverage | `search.py` | Creates zigzag or circle-spiral waypoints inside and beyond a selected 1 ft tile, using the 7 in × 5 in robot footprint. |
 | Simulation and data | `main.py` | Animates pivot-in-place and forward-only motion, accepts spill locations, shows the current command vector, and saves a JSON plan. |
+| ESP32 radio bridge | `esp32_main_control.py` | Runs on the USB-connected main-control ESP32; forwards computer commands to the robot over ESP-NOW and relays robot messages back over USB serial. |
 | System description | `docs/system_design.tex` | Higher-level, physical-system-oriented description of the planner, data flow, coordinate frame, and limits. |
+
+## ESP32 main-control bridge
+
+`esp32_main_control.py` is MicroPython firmware for the main-control ESP32. It
+is separate from the desktop Tkinter program in `main.py`: the desktop program
+does not yet open a serial port or apply robot completion messages to its map.
+The bridge provides the communication link that can be connected to that
+program in a later step.
+
+### Configure and run
+
+1. Install MicroPython on the main-control ESP32 and connect it to the computer
+   over USB.
+2. Open `esp32_main_control.py` in a MicroPython tool such as Thonny and set
+   `WIFI_CHANNEL` to the channel used by the robot ESP32.
+3. Replace `ROBOT_MAC` with the robot's six-byte MAC address, for example
+   `b'\\x24\\x6F\\x28\\xAA\\xBB\\xCC'`. The robot must use the same Wi-Fi channel.
+4. Save/run the script on the main-control ESP32. It prints a `READY` line
+   when ESP-NOW and the serial bridge are initialized.
+
+The USB serial protocol and ESP-NOW payloads are plain text, with one message
+per line and fields separated by `|`. The computer sends the command directly;
+the bridge forwards it unchanged to the robot. For example, a task command is:
+
+```text
+TASK|1|0|0|Zigzag
+```
+
+The fields are message type, task ID, zero-based row, zero-based column, and
+pattern name. The equivalent Python f-string is:
+
+```python
+message = f"TASK|{task_id}|{row}|{column}|{pattern}"
+```
+
+The robot firmware should parse the same fields and, after completing the
+square, reply with a line such as:
+
+```text
+DONE|1|0|0
+```
+
+Keep each ESP-NOW message at or below 240 encoded bytes. Send one short task or
+waypoint at a time rather than a full detailed path. The bridge prints
+`READY|channel|mac` at startup, `TX|message` after a successful send,
+`TX_FAIL|message` if ESP-NOW reports a failed send, and
+`RX|sender_mac|robot_message` for each robot message. It prints `ERROR|reason`
+for an oversized or otherwise invalid serial command.
+
+The desktop program can parse a received `RX` line, then act only when its
+robot message is `DONE` for the active task ID and tile. It should mark that
+square complete and select the next target after that matching completion;
+`TX` only reports that the radio send succeeded. The bridge does not retry
+commands, track task IDs, or update the Tkinter map by itself. The robot
+firmware and future desktop serial integration must implement those behaviors.
 
 ## How the Python files communicate
 
