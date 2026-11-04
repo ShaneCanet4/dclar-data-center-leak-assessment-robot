@@ -154,10 +154,16 @@ No motor pinout or driver model has been assumed. Without that setup, the
 receiver returns a configuration error instead of moving. The reported pose
 is commanded odometry, not localization; there is no obstacle safety model.
 
-The app's **Ping ESP32** button sends `PING|token`. The board answers
-`PONG|token` locally over USB, and its TFT displays both lines. This checks the
-computer-to-board serial link without requiring the robot. `RX|mac|message`
-lines are forwarded from the robot and shown in the control window log.
+The app's **Ping ESP32** button sends `PING|GUI####`, where `####` is an
+app-local counter (for example, `PING|GUI0022`). The `GUI` prefix identifies
+that the request came from the GUI's manual test button. The board echoes the
+same token in `PONG|GUI0022`, letting the app match the response to its ping.
+It is only a request ID; it is not a robot ID, MAC address, or command. The
+automatic **Connect + identify** check uses the `APP####` prefix instead.
+Both PING types are answered locally over USB, and the TFT displays the
+request/reply. This checks the computer-to-board serial link without requiring
+the robot. `RX|mac|message` lines are forwarded from the robot and shown in the
+control window log.
 
 The robot replies to path segments using this completion format:
 

@@ -193,6 +193,13 @@ ESP-NOW to the configured robot MAC on the shared Wi-Fi channel. Robot replies
 are relayed to the desktop as \texttt{RX|mac|message} and shown on the main
 board TFT.
 
+The desktop's USB check includes a correlation token. The manual GUI test
+uses tokens such as \texttt{GUI0022}; the automatic connect check uses tokens
+such as \texttt{APP0001}. The board returns the same token in
+\texttt{PONG|token}, allowing the desktop to match the response to its
+request. These prefixes and counters identify the source/request only; they
+are not robot addresses or movement commands.
+
 For planned movement, the desktop serializes each entry in
 \texttt{movement\_command\_vector} using the format
 \texttt{SEG|mission|sequence|pivot|distance|x|y|heading}. It sends a single
