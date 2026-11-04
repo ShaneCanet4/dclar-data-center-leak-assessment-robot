@@ -38,6 +38,15 @@ import json                         # Save the planned route as a readable file.
 import tkinter as tk                # Base windows, Canvas drawing, and events.
 from tkinter import ttk             # Themed labels, buttons, frames, and menus.
 from pathlib import Path             # Build a save-file path beside this script.
+from tkinter import messagebox
+
+from serial_link import SerialLink, available_ports
+from serial_protocol import (
+    make_move_message,
+    make_ping_message,
+    make_segment_message,
+    make_task_message,
+)
 
 from route import nearest_unsearched, path_between, uniform_rack_obstacles
 from search import (
@@ -101,6 +110,19 @@ local_canvas = None                # Enlarged one-square pattern canvas.
 route_status = None                # Completion/obstacle count shown under both views.
 main_after_id = None               # Timer handle, so close can cancel the callback.
 paused = False
+esp32_link = None
+control_window = None
+control_log = None
+next_task_id = 1
+next_ping_id = 1
+serial_port_map = {}
+pending_ping_tokens = set()
+last_serial_port_signature = None
+hardware_mission_counter = 1
+hardware_mission_id = None
+hardware_path_commands = []
+hardware_path_index = 0
+hardware_waiting_sequence = None
 
 
 # -------------------------------- Main window -------------------------------
@@ -227,6 +249,30 @@ ttk.Label(
     wraplength=MAP_WIDTH + LOCAL_PIXELS + 30,
     padding=(8, 0, 8, 10),
 ).grid(row=6, column=0, sticky="w")
+
+# USB connection controls stay in the main window so the correct COM port is
+# visible while the planner is running.
+serial_frame = ttk.LabelFrame(window, text="Main-control ESP32 USB link", padding=8)
+serial_frame.grid(row=7, column=0, padx=8, pady=(0, 10), sticky="ew")
+serial_status_text = tk.StringVar(value="Disconnected")
+ttk.Label(serial_frame, text="COM port:").grid(row=0, column=0, padx=(0, 5))
+serial_port_choice = tk.StringVar()
+serial_port_menu = ttk.Combobox(
+    serial_frame, textvariable=serial_port_choice, values=(), state="readonly", width=14
+)
+serial_port_menu.grid(row=0, column=1, padx=(0, 6))
+ttk.Button(serial_frame, text="Refresh", command=lambda: refresh_serial_ports()).grid(
+    row=0, column=2, padx=(0, 6)
+)
+serial_connect_button = ttk.Button(
+    serial_frame, text="Connect + identify", command=lambda: toggle_serial_connection()
+)
+serial_connect_button.grid(row=0, column=3, padx=(0, 10))
+ttk.Button(
+    serial_frame, text="Robot control / communication test",
+    command=lambda: open_robot_control(),
+).grid(row=0, column=4, padx=(0, 10))
+ttk.Label(serial_frame, textvariable=serial_status_text).grid(row=0, column=5, sticky="w")
 
 
 def map_center(row, column):
@@ -1138,6 +1184,9 @@ def update_search():
 def toggle_pause():
     """Pause or resume motion without closing the application window."""
     global paused, leak_stop_latched
+    if hardware_mission_id is not None:
+        serial_status_text.set("Robot path is active; wait for robot DONE before resuming")
+        return
     if leak_stop_latched:
         # A leak stop is intentionally latched; the operator must acknowledge
         # it before the path planner can issue motion again.
@@ -1163,6 +1212,9 @@ def reset_search():
     global travel_points, planned_route, active_pattern, paused, spill_mode
     global spill_selection_cell
     global leak_stop_latched
+    if hardware_mission_id is not None:
+        serial_status_text.set("Wait for or stop the active hardware path before resetting")
+        return
     grid.reset()
     # SearchGrid.reset() clears all obstacles, so restore the standard rack
     # layout immediately afterward. Manually toggled obstacles are reset away.
@@ -1190,6 +1242,468 @@ def reset_search():
     redraw()
 
 
+def refresh_serial_ports():
+    """Refresh the COM-port menu from ports currently detected by Windows."""
+    global serial_port_map, last_serial_port_signature
+    previous_choice = serial_port_choice.get()
+    previous_device = serial_port_map.get(previous_choice, previous_choice.split(" —", 1)[0])
+    try:
+        ports = available_ports()
+    except Exception as error:
+        serial_port_map = {}
+        serial_port_menu.configure(values=())
+        serial_port_choice.set("")
+        serial_status_text.set("Port scan failed: %s" % error)
+        return
+
+    last_serial_port_signature = tuple(
+        (port.device, getattr(port, "description", None)) for port in ports
+    )
+
+    choices = []
+    serial_port_map = {}
+    for port_info in ports:
+        description = (getattr(port_info, "description", None) or "USB serial device").strip()
+        label = "%s — %s" % (port_info.device, description)
+        choices.append(label)
+        serial_port_map[label] = port_info.device
+
+    serial_port_menu.configure(values=choices)
+    matching_choice = next(
+        (label for label, device in serial_port_map.items() if device == previous_device),
+        None,
+    )
+    if matching_choice:
+        serial_port_choice.set(matching_choice)
+    elif choices:
+        serial_port_choice.set(choices[0])
+    else:
+        serial_port_choice.set("")
+
+    if not choices and esp32_link is None:
+        serial_status_text.set("No USB serial ports found")
+
+
+def monitor_serial_port_changes():
+    """Notice USB devices plugged in after the app starts, while disconnected."""
+    global last_serial_port_signature
+    if esp32_link is None:
+        try:
+            ports = available_ports()
+            signature = tuple(
+                (port.device, getattr(port, "description", None)) for port in ports
+            )
+        except Exception:
+            signature = None
+        if signature is not None and signature != last_serial_port_signature:
+            refresh_serial_ports()
+    window.after(2000, monitor_serial_port_changes)
+
+
+def toggle_serial_connection():
+    """Connect to or disconnect from the selected USB serial port."""
+    global esp32_link
+    if esp32_link is not None:
+        esp32_link.close()
+        esp32_link = None
+        pending_ping_tokens.clear()
+        serial_connect_button.configure(text="Connect + identify")
+        serial_status_text.set("Disconnected")
+        append_serial_log("USB serial disconnected")
+        return
+
+    port_choice = serial_port_choice.get().strip()
+    port = serial_port_map.get(port_choice, port_choice.split(" —", 1)[0])
+    if not port:
+        refresh_serial_ports()
+        serial_status_text.set("Select the ESP32 COM port first")
+        return
+    try:
+        esp32_link = SerialLink(port)
+        serial_connect_button.configure(text="Disconnect")
+        serial_status_text.set("Connected to %s; waiting for board…" % port)
+        append_serial_log("Opening %s" % port)
+        window.after(1200, send_connection_ping)
+    except Exception as error:
+        esp32_link = None
+        serial_status_text.set("Could not open %s: %s" % (port, error))
+
+
+def send_connection_ping():
+    """Check USB communication shortly after a COM port opens."""
+    global next_ping_id
+    if esp32_link is None:
+        return
+    token = "APP%04d" % next_ping_id
+    next_ping_id += 1
+    pending_ping_tokens.add(token)
+    message = make_ping_message(token)
+    if send_esp32_line(message):
+        serial_status_text.set("Connected; checking USB communication…")
+
+
+def append_serial_log(message):
+    """Append a received/sent serial event to the optional control window."""
+    if control_log is None:
+        return
+    try:
+        control_log.configure(state="normal")
+        control_log.insert("end", str(message) + "\n")
+        control_log.see("end")
+        control_log.configure(state="disabled")
+    except tk.TclError:
+        pass
+
+
+def send_esp32_line(message):
+    """Send one text-protocol line to the connected main-control ESP32."""
+    if esp32_link is None:
+        serial_status_text.set("Connect to the main-control ESP32 first")
+        append_serial_log("Not sent: USB serial is disconnected")
+        return False
+    try:
+        esp32_link.send_line(message)
+        append_serial_log("PC -> ESP32: " + message)
+        return True
+    except Exception as error:
+        serial_status_text.set("Serial send failed: %s" % error)
+        append_serial_log("Serial send failed: %s" % error)
+        return False
+
+
+def stop_hardware_mission(message):
+    """Clear the queued path after the robot reports an execution error."""
+    global hardware_mission_id, hardware_path_commands, hardware_waiting_sequence
+    hardware_mission_id = None
+    hardware_path_commands = []
+    hardware_waiting_sequence = None
+    pause_button.configure(text="Resume", state="normal")
+    serial_status_text.set(message)
+    append_serial_log(message)
+
+
+def send_next_hardware_segment():
+    """Send one planned segment and wait for its matching robot DONE reply."""
+    global hardware_waiting_sequence
+    if hardware_mission_id is None:
+        return
+    if hardware_path_index >= len(hardware_path_commands):
+        finish_hardware_mission()
+        return
+    command = hardware_path_commands[hardware_path_index]
+    try:
+        message = make_segment_message(
+            hardware_mission_id, hardware_path_index, command
+        )
+    except Exception as error:
+        stop_hardware_mission("Path command invalid: %s" % error)
+        return
+    hardware_waiting_sequence = hardware_path_index
+    if send_esp32_line(message):
+        serial_status_text.set(
+            "Sent path segment %d/%d; waiting for robot DONE" % (
+                hardware_path_index + 1, len(hardware_path_commands)
+            )
+        )
+    else:
+        stop_hardware_mission("Could not send path segment")
+
+
+def finish_hardware_mission():
+    """Mark the active target searched after every planned segment returns DONE."""
+    global hardware_mission_id, hardware_path_commands, hardware_waiting_sequence, paused
+    finished_cell = grid.target_cell
+    if finished_cell is not None:
+        completed_path_records.append(
+            make_path_record(finished_cell, active_pattern, path_points)
+        )
+        grid.complete_target()
+        choose_next_target()
+    hardware_mission_id = None
+    hardware_path_commands = []
+    hardware_waiting_sequence = None
+    paused = True
+    pause_button.configure(text="Resume", state="normal")
+    serial_status_text.set("Robot completed the planned square; next path is ready")
+    append_serial_log("Hardware mission completed all segments")
+    redraw()
+
+
+def handle_robot_radio_event(line):
+    """Process a robot reply relayed by the main-control ESP32."""
+    global hardware_path_index, robot_row, robot_column, robot_heading
+    fields = line.split("|", 2)
+    if len(fields) < 3 or fields[0] != "RX":
+        return
+    robot_fields = fields[2].split("|")
+    kind = robot_fields[0]
+
+    if kind == "RECEIVED" and len(robot_fields) >= 3:
+        mission, sequence = robot_fields[1], robot_fields[2]
+        if mission == hardware_mission_id and sequence == str(hardware_waiting_sequence):
+            serial_status_text.set("Robot accepted segment %s; executing" % sequence)
+        return
+    if kind == "PLAN":
+        append_serial_log("Robot wheel plan: " + fields[2])
+        return
+    if kind == "ERR":
+        stop_hardware_mission("Robot rejected command: " + fields[2])
+        return
+    if kind != "DONE" or len(robot_fields) < 3:
+        return
+
+    mission, sequence_text = robot_fields[1], robot_fields[2]
+    try:
+        sequence = int(sequence_text)
+    except ValueError:
+        return
+    if (
+        mission != hardware_mission_id
+        or sequence != hardware_waiting_sequence
+        or sequence != hardware_path_index
+    ):
+        append_serial_log("Ignored stale/unmatched robot DONE: " + fields[2])
+        return
+
+    # DONE is emitted only after the robot's configured motor backend reports
+    # encoder completion. The GUI pose is the commanded odometry estimate.
+    command = hardware_path_commands[hardware_path_index]
+    robot_column = command["target_x_ft"]
+    robot_row = command["target_y_ft"]
+    robot_heading = math.radians(command["global_heading_degrees"])
+    hardware_path_index += 1
+    hardware_waiting_sequence = None
+    if hardware_path_index >= len(hardware_path_commands):
+        finish_hardware_mission()
+    else:
+        redraw()
+        send_next_hardware_segment()
+
+
+def start_hardware_path():
+    """Pause the simulator and stream its remaining path one DONE at a time."""
+    global paused
+    global hardware_mission_counter, hardware_mission_id
+    global hardware_path_commands, hardware_path_index, hardware_waiting_sequence
+    if esp32_link is None:
+        serial_status_text.set("Connect to the main-control ESP32 first")
+        return
+    if leak_stop_latched:
+        serial_status_text.set("Acknowledge the leak stop before sending a path")
+        return
+    if hardware_mission_id is not None:
+        serial_status_text.set("A hardware path is already in progress")
+        return
+    if not movement_command_vector:
+        update_command_readout()
+    if not movement_command_vector:
+        serial_status_text.set("There is no planned movement path to send")
+        return
+
+    hardware_mission_id = "H%04d" % hardware_mission_counter
+    hardware_mission_counter += 1
+    hardware_path_commands = [dict(command) for command in movement_command_vector]
+    hardware_path_index = 0
+    hardware_waiting_sequence = None
+    paused = True
+    pause_button.configure(text="Robot busy", state="disabled")
+    redraw()
+    append_serial_log(
+        "Starting %s with %d segments" % (
+            hardware_mission_id, len(hardware_path_commands)
+        )
+    )
+    send_next_hardware_segment()
+
+
+def poll_serial_events():
+    """Move background serial-reader events onto Tkinter's UI thread."""
+    if esp32_link is not None:
+        while True:
+            try:
+                line = esp32_link.events.get_nowait()
+            except Exception:
+                break
+            append_serial_log("ESP32 -> PC: " + line)
+            if line.startswith("READY|"):
+                serial_status_text.set("Connected to %s; board ready" % esp32_link.port)
+            elif line.startswith("PONG|"):
+                token = line.split("|", 1)[1]
+                if token in pending_ping_tokens:
+                    pending_ping_tokens.discard(token)
+                    serial_status_text.set("ESP32 identified; USB ping passed")
+                else:
+                    serial_status_text.set("Unexpected PONG token: %s" % token)
+            elif line.startswith("RX|"):
+                serial_status_text.set("Robot radio message received")
+                handle_robot_radio_event(line)
+            elif line.startswith("TX_FAIL|") or line.startswith("ERROR|"):
+                serial_status_text.set(line)
+            elif line.startswith("SERIAL_ERROR|"):
+                serial_status_text.set(line)
+    window.after(100, poll_serial_events)
+
+
+def open_robot_control():
+    """Open task, coordinate, and USB communication controls in a child window."""
+    global control_window, control_log, next_task_id, next_ping_id
+    if control_window is not None and control_window.winfo_exists():
+        control_window.deiconify()
+        control_window.lift()
+        return
+
+    control_window = tk.Toplevel(window)
+    control_window.title("ESP32 Robot Control")
+    control_window.geometry("560x570")
+    control_window.protocol("WM_DELETE_WINDOW", close_robot_control)
+    ttk.Label(
+        control_window,
+        text="Send text commands through the main-control ESP32.",
+        padding=(10, 10, 10, 4),
+    ).grid(row=0, column=0, sticky="w")
+
+    connection_frame = ttk.Frame(control_window, padding=(10, 0, 10, 8))
+    connection_frame.grid(row=1, column=0, sticky="ew")
+    ttk.Label(connection_frame, textvariable=serial_status_text).grid(row=0, column=0, sticky="w")
+
+    task_frame = ttk.LabelFrame(control_window, text="Search-square task", padding=10)
+    task_frame.grid(row=2, column=0, padx=10, pady=4, sticky="ew")
+    ttk.Label(task_frame, text="Task ID").grid(row=0, column=0, sticky="w")
+    task_id_var = tk.StringVar(value=str(next_task_id))
+    task_id_entry = ttk.Entry(task_frame, textvariable=task_id_var, width=9)
+    task_id_entry.grid(row=1, column=0, padx=(0, 8), sticky="w")
+    ttk.Label(task_frame, text="Row (0-based)").grid(row=0, column=1, sticky="w")
+    row_var = tk.StringVar(value=str(grid.target_cell[0] if grid.target_cell else 0))
+    row_entry = ttk.Entry(task_frame, textvariable=row_var, width=9)
+    row_entry.grid(row=1, column=1, padx=(0, 8), sticky="w")
+    ttk.Label(task_frame, text="Column (0-based)").grid(row=0, column=2, sticky="w")
+    column_var = tk.StringVar(value=str(grid.target_cell[1] if grid.target_cell else 0))
+    column_entry = ttk.Entry(task_frame, textvariable=column_var, width=9)
+    column_entry.grid(row=1, column=2, padx=(0, 8), sticky="w")
+    ttk.Label(task_frame, text="Pattern").grid(row=0, column=3, sticky="w")
+    task_pattern_var = tk.StringVar(value=pattern_choice.get())
+    ttk.Combobox(
+        task_frame, textvariable=task_pattern_var,
+        values=("Zigzag", "Circle spiral"), state="readonly", width=15,
+    ).grid(row=1, column=3, sticky="w")
+
+    def use_active_target():
+        if grid.target_cell is not None:
+            row_var.set(str(grid.target_cell[0]))
+            column_var.set(str(grid.target_cell[1]))
+            task_pattern_var.set(pattern_choice.get())
+
+    def send_square_task():
+        nonlocal task_id_var
+        global next_task_id
+        try:
+            message = make_task_message(
+                task_id_var.get(), row_var.get(), column_var.get(), task_pattern_var.get()
+            )
+            if send_esp32_line(message):
+                next_task_id = int(task_id_var.get()) + 1
+                task_id_var.set(str(next_task_id))
+        except Exception as error:
+            messagebox.showerror("Invalid square task", str(error), parent=control_window)
+
+    ttk.Button(task_frame, text="Use active map target", command=use_active_target).grid(
+        row=2, column=0, columnspan=2, pady=(10, 0), sticky="w"
+    )
+    ttk.Button(task_frame, text="Send task", command=send_square_task).grid(
+        row=2, column=3, pady=(10, 0), sticky="e"
+    )
+
+    move_frame = ttk.LabelFrame(control_window, text="Coordinate / instruction", padding=10)
+    move_frame.grid(row=3, column=0, padx=10, pady=4, sticky="ew")
+    move_id_var = tk.StringVar(value=str(next_task_id))
+    x_var = tk.StringVar(value="0.50")
+    y_var = tk.StringVar(value="0.50")
+    heading_var = tk.StringVar(value="AUTO")
+    instruction_var = tk.StringVar(value="DRIVE")
+    for column, label in enumerate(("Task ID", "X (ft)", "Y (ft)", "Heading (deg)")):
+        ttk.Label(move_frame, text=label).grid(row=0, column=column, padx=(0, 6), sticky="w")
+    move_id_entry = ttk.Entry(move_frame, textvariable=move_id_var, width=10)
+    move_id_entry.grid(row=1, column=0, padx=(0, 6), sticky="w")
+    ttk.Entry(move_frame, textvariable=x_var, width=10).grid(row=1, column=1, padx=(0, 6), sticky="w")
+    ttk.Entry(move_frame, textvariable=y_var, width=10).grid(row=1, column=2, padx=(0, 6), sticky="w")
+    ttk.Entry(move_frame, textvariable=heading_var, width=14).grid(row=1, column=3, sticky="w")
+    ttk.Label(move_frame, text="Instruction").grid(row=2, column=0, pady=(8, 0), sticky="w")
+    ttk.Entry(move_frame, textvariable=instruction_var, width=32).grid(
+        row=3, column=0, columnspan=3, padx=(0, 8), sticky="ew"
+    )
+
+    def send_coordinate_instruction():
+        global next_task_id
+        try:
+            message = make_move_message(
+                move_id_var.get(), x_var.get(), y_var.get(), heading_var.get(),
+                instruction_var.get(),
+            )
+            if send_esp32_line(message):
+                next_task_id = int(move_id_var.get()) + 1
+                move_id_var.set(str(next_task_id))
+                task_id_var.set(str(next_task_id))
+        except Exception as error:
+            messagebox.showerror("Invalid coordinate command", str(error), parent=control_window)
+
+    ttk.Button(move_frame, text="Send coordinate command", command=send_coordinate_instruction).grid(
+        row=3, column=3, padx=(6, 0), sticky="e"
+    )
+
+    test_frame = ttk.LabelFrame(control_window, text="USB communication test", padding=10)
+    test_frame.grid(row=4, column=0, padx=10, pady=4, sticky="ew")
+    ttk.Label(
+        test_frame,
+        text="PING/PONG verifies the computer ↔ main-control ESP32 USB link.",
+    ).grid(row=0, column=0, sticky="w")
+
+    def send_usb_ping():
+        global next_ping_id
+        try:
+            token = "GUI%04d" % next_ping_id
+            next_ping_id += 1
+            pending_ping_tokens.add(token)
+            message = make_ping_message(token)
+            if send_esp32_line(message):
+                serial_status_text.set("PING sent; waiting for PONG…")
+        except Exception as error:
+            messagebox.showerror("Communication test", str(error), parent=control_window)
+
+    ttk.Button(test_frame, text="Ping ESP32", command=send_usb_ping).grid(
+        row=1, column=0, pady=(8, 0), sticky="w"
+    )
+    ttk.Label(
+        test_frame,
+        text="MOVE accepts DRIVE or TURN. Use AUTO to face a DRIVE target; TURN needs a numeric heading.",
+        wraplength=510,
+    ).grid(row=2, column=0, pady=(6, 0), sticky="w")
+    ttk.Button(
+        test_frame,
+        text="Send planned path (wait for each robot DONE)",
+        command=lambda: start_hardware_path(),
+    ).grid(row=3, column=0, pady=(8, 0), sticky="w")
+
+    log_frame = ttk.LabelFrame(control_window, text="Serial activity", padding=8)
+    log_frame.grid(row=5, column=0, padx=10, pady=(4, 10), sticky="nsew")
+    control_window.rowconfigure(5, weight=1)
+    control_window.columnconfigure(0, weight=1)
+    control_log = tk.Text(log_frame, height=9, width=68, state="disabled", wrap="word")
+    control_log.grid(row=0, column=0, sticky="nsew")
+    log_frame.rowconfigure(0, weight=1)
+    log_frame.columnconfigure(0, weight=1)
+    if esp32_link is None:
+        append_serial_log("Connect to the ESP32 from the main window first.")
+
+
+def close_robot_control():
+    """Close the child window while keeping the main serial connection open."""
+    global control_window, control_log
+    if control_window is not None:
+        control_window.destroy()
+    control_window = None
+    control_log = None
+
+
 def close_main_window():
     """Cancel the pending timer before destroying the app's windows.
 
@@ -1199,16 +1713,21 @@ def close_main_window():
     if main_after_id is not None:
         # after_cancel(id) removes a callback that was queued with window.after().
         window.after_cancel(main_after_id)
+    if esp32_link is not None:
+        esp32_link.close()
     # destroy() closes this window and releases its Tk widgets.
     window.destroy()
 
 
 # protocol() replaces the normal window-close action with our cleanup function.
 window.protocol("WM_DELETE_WINDOW", close_main_window)
+refresh_serial_ports()
+window.after(2000, monitor_serial_port_changes)
 choose_next_target()
 redraw()
 # after(ms, callback) queues the first animation frame 25 ms from now.
 main_after_id = window.after(FRAME_MS, update_search)
+window.after(100, poll_serial_events)
 # mainloop() is Tkinter's event loop. It keeps the app open and processes input,
 # redraw requests, and scheduled after() callbacks until the window is closed.
 window.mainloop()

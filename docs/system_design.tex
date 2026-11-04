@@ -18,8 +18,9 @@ DCLAR is a software prototype for planning a leak-search route over a gridded
 data-center floor. It separates floor-tile routing from within-tile coverage,
 represents turns as in-place pivots, and stores destinations in a global map
 frame. Spill locations can be annotated at sub-tile resolution. The current
-program visualizes this plan; it does not read a leak sensor or command physical
-motors.
+program visualizes this plan and has an optional USB-to-ESP-NOW command path.
+Physical motor execution still requires a calibrated encoder driver and
+hardware-specific pin configuration that are not included.
 \end{abstract}
 
 \section{System boundary}
@@ -41,7 +42,7 @@ Map model & Cell occupancy, completed search cells, spill annotations \\
 Route planner & Select a reachable unsearched cell and find a shortest grid path \\
 Coverage planner & Generate ordered local waypoints for one cell \\
 Motion representation & Convert consecutive waypoints to pivot-and-drive records \\
-Execution layer & Currently a GUI animation; physical sensors and motors are absent \\
+Execution layer & GUI simulation and command protocol; calibrated motor driver is absent \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -108,7 +109,8 @@ Each entry in the program's \texttt{movement\_command\_vector} contains
 \texttt{distance\_forward\_ft}. A physical low-level controller would need
 to execute the pivot, verify heading, drive toward the target, and verify
 position with encoders and/or localization sensors. The current animation
-illustrates this sequence but does not provide motor commands.
+illustrates this sequence and can serialize path segments, but does not
+provide a configured board-specific motor driver.
 
 \section{Spill annotation and saved data}
 
@@ -180,6 +182,39 @@ Python field & Type & Meaning \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+\section{Hardware communication and path hand-off}
+
+The planner modules remain ordinary data functions, while \texttt{main.py}
+owns the optional hardware link. The desktop sends one newline-terminated,
+pipe-delimited command over USB serial to \texttt{esp32\_main\_control.py}.
+That ESP32 answers \texttt{PING} locally and forwards other messages over
+ESP-NOW to the configured robot MAC on the shared Wi-Fi channel. Robot replies
+are relayed to the desktop as \texttt{RX|mac|message} and shown on the main
+board TFT.
+
+For planned movement, the desktop serializes each entry in
+\texttt{movement\_command\_vector} using the format
+\texttt{SEG|mission|sequence|pivot|distance|x|y|heading}. It sends a single
+segment, then waits for the matching \texttt{DONE|mission|sequence} before
+sending the next. The robot receiver parses the record, calculates
+differential-drive encoder targets, and reports \texttt{RECEIVED}, \texttt{PLAN},
+and then \texttt{DONE} after the configured motor driver returns. An
+\texttt{ERR} stops that mission. The desktop rejects stale mission IDs and
+sequence numbers; it marks the selected tile searched only when every segment
+in that mission has completed.
+
+The current robot receiver deliberately requires an encoder-aware
+\texttt{motor\_driver.py}, measured wheel diameter, wheel-center track width,
+encoder ticks per wheel revolution, and a configured maximum wheel speed. A
+positive pivot angle is clockwise/right: the left wheel target is positive
+and the right wheel target is negative. Each wheel's in-place pivot arc has
+magnitude $t|\theta|/2$, for track width $t$ and angle $\theta$ in radians;
+straight travel gives equal wheel targets. These encoder targets do not
+constitute physical motion until a calibrated driver executes them. No motor
+pin mapping, encoder calibration, localization, or obstacle sensing is
+currently provided. A completed status therefore means the configured driver
+reported encoder completion; the desktop pose remains an odometry estimate.
 
 These row/column pairs use zero-based Python indices. Thus the upper-left cell
 is $(0,0)$ in memory but is reported as row 1, column 1 in saved JSON. A set

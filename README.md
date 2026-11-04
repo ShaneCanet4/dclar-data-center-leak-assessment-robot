@@ -13,31 +13,86 @@ planner; it is not a robot controller or a leak sensor.
 | Map routing | `route.py` | Builds the rack map and uses breadth-first search (BFS) to find shortest four-direction paths around blocked tiles. |
 | Tile coverage | `search.py` | Creates zigzag or circle-spiral waypoints inside and beyond a selected 1 ft tile, using the 7 in × 5 in robot footprint. |
 | Simulation and data | `main.py` | Animates pivot-in-place and forward-only motion, accepts spill locations, shows the current command vector, and saves a JSON plan. |
-| ESP32 radio bridge | `esp32_main_control.py` | Runs on the USB-connected main-control ESP32; forwards computer commands to the robot over ESP-NOW and relays robot messages back over USB serial. |
+| USB serial link | `serial_link.py`, `serial_protocol.py` | Lists COM ports, connects the desktop app to the main-control ESP32, and formats text commands. |
+| ESP32 radio bridge and robot receiver | `esp32/` | Main-control USB/TFT bridge, robot ESP-NOW receiver, and differential-drive path-to-encoder translator. |
+| Communication checks | `test_serial_protocol.py`, `test_robot_motion.py`, `test_esp32_communication.py` | Unit-checks message and wheel-target formatting and tests USB PING/PONG. |
 | System description | `docs/system_design.tex` | Higher-level, physical-system-oriented description of the planner, data flow, coordinate frame, and limits. |
 
 ## ESP32 main-control bridge
 
-`esp32_main_control.py` is MicroPython firmware for the main-control ESP32. It
-is separate from the desktop Tkinter program in `main.py`: the desktop program
-does not yet open a serial port or apply robot completion messages to its map.
-The bridge provides the communication link that can be connected to that
-program in a later step.
+`esp32/esp32_main_control.py` is MicroPython firmware for the main-control ESP32.
+The desktop `main.py` selects a USB serial port and sends commands to the main
+board. **Send planned path** streams one segment at a time and waits for the
+matching robot `DONE` before sending the next. A target is marked searched
+only after all its segments report completion.
 
 ### Configure and run
 
 1. Install MicroPython on the main-control ESP32 and connect it to the computer
-   over USB.
-2. Open `esp32_main_control.py` in a MicroPython tool such as Thonny and set
-   `WIFI_CHANNEL` to the channel used by the robot ESP32.
-3. Replace `ROBOT_MAC` with the robot's six-byte MAC address, for example
-   `b'\\x24\\x6F\\x28\\xAA\\xBB\\xCC'`. The robot must use the same Wi-Fi channel.
-4. Save/run the script on the main-control ESP32. It prints a `READY` line
-   when ESP-NOW and the serial bridge are initialized.
+   with a USB data cable.
+2. In Thonny, select **MicroPython (ESP32)** and the board's COM port. Copy
+   `esp32/esp32_main_control.py` and `esp32/board_display.py` to the MicroPython device.
+   `board_display.py` uses the same display driver and font as the known-working
+   board test: also copy `st7789py.py` and `vga1_16x32.py` to the device root.
+   They are in the upstream [ST7789 MicroPython driver](https://github.com/russhughes/st7789py_mpy/tree/master/lib)
+   and its [ROM font folder](https://github.com/russhughes/st7789py_mpy/tree/master/romfonts).
+   If the board was erased while flashing MicroPython, copy all four files again.
+   Save these modules at the device root in Thonny; the `esp32/` prefix is only
+   the folder name on the computer. Save `esp32_main_control.py` on the device
+   as **`main.py`** so MicroPython starts the bridge after reset. If it is only
+   run from Thonny, the bridge stops when the session is interrupted and the
+   board returns to the `>>>` Python prompt.
+   In `esp32_main_control.py`, set `WIFI_CHANNEL` to the robot's channel and
+   replace `ROBOT_MAC` with the robot's six-byte address, for example
+   `b'\\x24\\x6F\\x28\\xAA\\xBB\\xCC'`.
+3. Reset the board. Confirm the serial output prints `READY|channel|mac` and
+   stays in the bridge loop (there should be no `>>>` prompt). It initializes the built-in
+   240×135 ST7789 display using the Feather ESP32-S3 TFT pins shown in the
+   provided pinout: power GPIO21, CS GPIO7, DC GPIO39, reset GPIO40,
+   backlight GPIO45, and SPI SCK/MOSI GPIO36/GPIO35. The screen shows the latest
+   USB command, radio transmit, or robot reply.
+4. On the computer, install dependencies with `python -m pip install -r
+   requirements.txt`, run `python main.py`, select the ESP32's COM port in the
+   USB link row, and click **Connect**. Close Thonny's serial connection first
+   if it has the COM port open.
+
+#### Windows USB connection checklist
+
+Run the desktop app from this project directory so its modules are found. If
+using the Python 3.12 installation that has pyserial, run
+`py -3.12 .\main.py`. If another interpreter is selected, install pyserial
+into that exact interpreter and launch with it; a package installed for one
+Python does not make it available to another. For example:
+
+```powershell
+py -3.12 -m pip install -r requirements.txt
+py -3.12 .\main.py
+```
+
+In the port list, select the entry described as **USB Serial Device** (COM8 in
+the currently observed setup); COM3 and COM4 were Bluetooth serial ports. Port
+numbers can change after reconnecting, so identify the board by its USB
+description and by the successful **Connect + identify** PING/PONG test.
+Thonny and the desktop app cannot use the same COM port at the same time: close
+Thonny's Shell/serial session before connecting from the app.
+
+The USB bridge must be running on the main-control ESP32. In Thonny, save
+`esp32/esp32_main_control.py` to the device as `/main.py`, with
+`board_display.py`, `st7789py.py`, and `vga1_16x32.py` at the device root, then
+reset the board. The serial output should show `READY|channel|mac` and remain
+in the bridge loop. A `>>>` prompt means the program returned to the REPL; a
+line like `PING|GUI0001` typed or sent at that prompt is treated as Python and
+will produce `NameError`. Confirm the bridge is running before sending app
+commands.
+
+While disconnected, the COM list refreshes automatically when USB devices are
+plugged in or removed. Each choice includes Windows' USB device description.
+**Connect + identify** sends a unique `PING` and only reports an ESP32 match
+after receiving the matching `PONG` token.
 
 The USB serial protocol and ESP-NOW payloads are plain text, with one message
-per line and fields separated by `|`. The computer sends the command directly;
-the bridge forwards it unchanged to the robot. For example, a task command is:
+per line and fields separated by `|`. The **Robot control / communication
+test** window sends these commands. A square task is:
 
 ```text
 TASK|1|0|0|Zigzag
@@ -50,11 +105,64 @@ pattern name. The equivalent Python f-string is:
 message = f"TASK|{task_id}|{row}|{column}|{pattern}"
 ```
 
-The robot firmware should parse the same fields and, after completing the
-square, reply with a line such as:
+For direct coordinate and instruction testing, the app sends a `MOVE` line:
 
 ```text
-DONE|1|0|0
+MOVE|2|1.25|3.50|90.0|DRIVE
+```
+
+Its fields are task ID, target X/Y in feet, heading in degrees (or `AUTO`), and
+instruction (`DRIVE` or `TURN`). `DRIVE` heads toward the target; a numeric
+heading must agree within 3 degrees. `TURN` pivots in place to the requested
+heading. `TASK` is rejected with `PATH_SEGMENTS_REQUIRED`; use **Send planned
+path** to send planner output.
+
+### Robot receiver and path execution protocol
+
+Copy `esp32/esp32_robot_control.py` and `esp32/robot_motion.py` to the robot
+ESP32 root using Thonny. Set both ESP32s to the same `WIFI_CHANNEL`; the main
+board also needs the robot's MAC in `ROBOT_MAC`. The robot learns the main
+board's MAC from its first radio packet.
+
+The desktop sends each planned vector entry as a simple f-string encoded line:
+
+```text
+SEG|mission_id|sequence|pivot_degrees|distance_ft|target_x_ft|target_y_ft|heading_degrees
+```
+
+The bridge forwards the line over ESP-NOW. The robot replies
+`RECEIVED|mission|sequence`, reports calculated encoder targets as
+`PLAN|mission|sequence|pivot:left_ticks:right_ticks,drive:left_ticks:right_ticks`,
+then sends `DONE|mission|sequence` after its motor backend succeeds. Failures
+return `ERR|mission|sequence|reason`. The desktop waits for matching `DONE`
+before it sends the next segment; only the final completion advances the map.
+
+`robot_motion.py` translates pivot-and-drive segments into signed wheel encoder
+targets. Positive angle means clockwise/right in the map: left wheel forward,
+right wheel backward. For pivot angle `a` and wheel-center track `t`, each
+wheel travels `t * radians(a) / 2`; convert that arc using tire circumference
+and encoder ticks per revolution. A straight drive gives both wheels equal
+positive ticks. Negative angles reverse the turn. Wheel track is the distance
+between wheel centerlines, not the 7 x 5 inch body size.
+
+Physical movement remains disabled until wheel diameter, wheel track, encoder
+ticks per wheel revolution, and maximum wheel speed are measured/configured in
+`esp32_robot_control.py`, and an encoder-aware `motor_driver.py` supplies
+`move_wheels(left_ticks, right_ticks, max_speed_mm_s, timeout_ms)` and `stop()`.
+It must stop on timeout/fault and return only after closed-loop completion.
+No motor pinout or driver model has been assumed. Without that setup, the
+receiver returns a configuration error instead of moving. The reported pose
+is commanded odometry, not localization; there is no obstacle safety model.
+
+The app's **Ping ESP32** button sends `PING|token`. The board answers
+`PONG|token` locally over USB, and its TFT displays both lines. This checks the
+computer-to-board serial link without requiring the robot. `RX|mac|message`
+lines are forwarded from the robot and shown in the control window log.
+
+The robot replies to path segments using this completion format:
+
+```text
+DONE|H0001|0
 ```
 
 Keep each ESP-NOW message at or below 240 encoded bytes. Send one short task or
@@ -64,12 +172,107 @@ waypoint at a time rather than a full detailed path. The bridge prints
 `RX|sender_mac|robot_message` for each robot message. It prints `ERROR|reason`
 for an oversized or otherwise invalid serial command.
 
-The desktop program can parse a received `RX` line, then act only when its
-robot message is `DONE` for the active task ID and tile. It should mark that
-square complete and select the next target after that matching completion;
-`TX` only reports that the radio send succeeded. The bridge does not retry
-commands, track task IDs, or update the Tkinter map by itself. The robot
-firmware and future desktop serial integration must implement those behaviors.
+The bridge does not retry commands. The desktop checks mission and sequence
+IDs and updates the map after all planned segments report `DONE`.
+
+### Testing and validation procedure
+
+Use these checks in order. The first checks are computer-only; the later checks
+need the main-control board and, for radio reception, a robot ESP32.
+
+#### 1. Check text protocol formatting
+
+From the project folder, run:
+
+```powershell
+python -m unittest test_serial_protocol.py test_robot_motion.py
+```
+
+Pass condition: all twelve tests pass. These cover `PING`, `TASK`, `MOVE`, and
+`SEG` formatting, invalid values, `RX` parsing, and differential-drive wheel
+target signs. They do not open a COM port or drive motors.
+
+#### 2. Check the USB serial round trip
+
+1. Flash/run `esp32/esp32_main_control.py` on the main-control ESP32, with
+   `esp32/board_display.py`, `st7789py.py`, and `vga1_16x32.py` copied to the board.
+2. Close Thonny's serial connection so it releases the COM port. Connect the
+   board to the computer with a USB data cable.
+3. Run `python test_esp32_communication.py`. Select the COM port shown for the
+   ESP32. Or pass it directly, for example:
+
+   ```powershell
+   python test_esp32_communication.py --port COM5
+   ```
+
+4. The script sends `PING|token` and waits up to eight seconds for the matching
+   `PONG|token`.
+
+Pass condition: the script prints `PASS`, the matching `PONG` appears on the
+serial console, and the TFT shows the PING/PONG status. This verifies USB data
+in both directions and the board's display update path. It does not exercise
+ESP-NOW.
+
+#### 3. Check connection through the desktop app
+
+1. Run `python main.py` after installing `requirements.txt`.
+2. In **Main-control ESP32 USB link**, select the ESP32 COM port and click
+   **Connect**. The app sends an automatic tokenized PING; a matching PONG
+   identifies the selected port as the controller and confirms USB communication.
+3. Open **Robot control / communication test** and click **Ping ESP32**.
+
+Pass condition: the app log contains the sent `PING|token` and received
+`PONG|token`, the link status says the USB communication test passed, and the
+TFT displays the status. This checks the same USB path using the GUI's serial
+reader and port selection.
+
+#### 4. Check command forwarding over ESP-NOW
+
+This check requires the robot ESP32 to be powered, configured on the same
+channel, and running firmware that understands the text protocol.
+
+1. Connect the computer to the main-control ESP32 as above.
+2. Use **Send planned path**. Verify each `SEG` is followed by `RECEIVED`,
+   `PLAN`, and matching `DONE` relayed as `RX|mac|...`. The next segment must
+   wait for `DONE`; stale mission/sequence replies should be ignored.
+
+Pass condition: matching robot replies are visible on both main board and
+desktop. `TX` alone only means the main ESP32 reported a successful radio send.
+Motion completion requires measured geometry and a configured motor driver;
+otherwise the robot should return a clear setup error.
+
+#### 5. Validate path completion behavior
+
+Only after all segments have matching `DONE` replies does the app mark the
+target searched. Robot setup errors, stale mission IDs, and wrong sequence
+numbers must not advance the map.
+
+#### Troubleshooting
+
+- **No COM ports appear:** open Windows Device Manager and check **Ports (COM & LPT)**.
+  Unplug/reconnect the board to identify the new entry, confirm the USB-C cable
+  supports data, then click **Refresh** in the app. Install dependencies with
+  `python -m pip install -r requirements.txt` using the same Python interpreter
+  that launches `main.py`.
+- **You see a COM port in Device Manager but the app list is empty:** run
+  `python main.py` from the updated source folder, install pyserial in that
+  Python environment, then click **Refresh**. The prebuilt `release/DCLAR.exe`
+  may not include these latest serial changes. If launching with
+  `C:\\msys64\\mingw64\\bin\\python.exe`, first run
+  `& "C:\\msys64\\mingw64\\bin\\python.exe" -m ensurepip --upgrade`, then
+  `& "C:\\msys64\\mingw64\\bin\\python.exe" -m pip install pyserial`.
+  This Python installation may not include pip by default; another option is
+  or use a Python 3.12 environment that has pyserial with `py -3.12 main.py`.
+- **The port cannot be opened:** close Thonny or any other serial monitor that
+  may already have the COM port open.
+- **No `PONG` arrives:** check the selected COM port, confirm the board is
+  running this firmware, and reset/reconnect it before retrying.
+- **The TFT is blank:** confirm the board matches the Feather ESP32-S3 TFT
+  pinout, both MicroPython files are on the device, and the firmware reports
+  no `DISPLAY_ERROR` over serial.
+- **`TX_FAIL` or no robot `RX`:** check the robot MAC address and shared Wi-Fi
+  channel. Confirm the robot is running its ESP-NOW receiver and replying in
+  the documented text format.
 
 ## How the Python files communicate
 
