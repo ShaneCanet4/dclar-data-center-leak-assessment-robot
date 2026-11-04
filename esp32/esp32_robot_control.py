@@ -245,7 +245,8 @@ sys.stdout.write("ROBOT_READY|%d|%s\n" % (
 
 while True:
     received = radio.recv(0)
-    if received:
+    # recv(0) returns (None, None) when no packet is ready on MicroPython 1.28.
+    if received and received[0] is not None and received[1] is not None:
         sender_mac, raw_payload = received
         try:
             radio.add_peer(sender_mac)

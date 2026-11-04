@@ -91,7 +91,10 @@ show_status("Robot " + mac_to_text(ROBOT_MAC))
 while True:
     # Relay any waiting robot message to the computer and display.
     received = radio.recv(0)
-    if received:
+    # MicroPython 1.28 returns (None, None), a truthy tuple, when recv(0)
+    # finds no packet. Check both fields so the idle loop does not treat that
+    # timeout sentinel as a real robot message.
+    if received and received[0] is not None and received[1] is not None:
         sender_mac, raw_payload = received
         try:
             robot_text = raw_payload.decode().strip()
