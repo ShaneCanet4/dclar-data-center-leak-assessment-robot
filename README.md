@@ -16,7 +16,7 @@ planner; it is not a robot controller or a leak sensor.
 | USB serial link | `serial_link.py`, `serial_protocol.py` | Lists COM ports, connects the desktop app to the main-control ESP32, and formats text commands. |
 | ESP32 radio bridge and robot receiver | `esp32/` | Main-control USB/TFT bridge, robot ESP-NOW receiver, and differential-drive path-to-encoder translator. |
 | Communication checks | `test_serial_protocol.py`, `test_robot_motion.py`, `test_esp32_communication.py` | Unit-checks message and wheel-target formatting and tests USB PING/PONG. |
-| System description | `docs/system_design.tex` | Higher-level, physical-system-oriented description of the planner, data flow, coordinate frame, and limits. |
+| Living system architecture | `docs/system_design.tex` | Detailed architecture and data-flow description, current feature status, student design ownership, AI-assisted implementation contributions, and hardware limitations. Update this document alongside meaningful feature changes. |
 
 ## ESP32 main-control bridge
 

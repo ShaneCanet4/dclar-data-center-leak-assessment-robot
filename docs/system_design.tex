@@ -1,299 +1,484 @@
-\documentclass[11pt]{article}
+\documentclass{article}
 
-\usepackage[margin=1in]{geometry}
-\usepackage{amsmath,amssymb,booktabs}
-\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage[a4paper, top=2cm, bottom=2cm, left=3cm, right=3cm]{geometry}
+\usepackage{subcaption}
 \usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{float}
+\usepackage{physics}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{xcolor}
 \usepackage{listings}
 
-\title{DCLAR: Data Center Leak Assessment Robot\\High-Level System Design}
-\author{Student Design Prototype}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    columns=fullflexible,
+    frame=single,
+    showstringspaces=false
+}
+
+\title{\textbf{\textit{DCLAR}: Software Architecture, Subsystem Integration, and Hardware Bridge Interfaces}}
+\author{Data Center Leak Assessment Robot \\ Systems-Level Software Engineering: Shane Canet}
 \date{\today}
 
 \begin{document}
+
 \maketitle
+\tableofcontents
+\newpage
 
-\begin{abstract}
-DCLAR is a software prototype for planning a leak-search route over a gridded
-data-center floor. It separates floor-tile routing from within-tile coverage,
-represents turns as in-place pivots, and stores destinations in a global map
-frame. Spill locations can be annotated at sub-tile resolution. The current
-program visualizes this plan and has an optional USB-to-ESP-NOW command path.
-Physical motor execution still requires a calibrated encoder driver and
-hardware-specific pin configuration that are not included.
-\end{abstract}
+\section{Document Purpose, Status, and Collaboration}
 
-\section{System boundary}
+This is the living system-architecture document for DCLAR. It describes the design currently represented in the repository and is updated as features are added, changed, checked, or left as future work. The date on the title page is the date of the current document build. When updating a feature, preserve the explanation level used here: state what it does, how information moves through it, the assumptions and units it uses, what has been checked, and what remains unimplemented or uncalibrated. Update the relevant subsystem description and the status summary below in the same change.
 
-The modeled workspace is a $10\times10$ array of $1\,\mathrm{ft}$ square
-cells. Rack rows are represented by blocked cells. A simulated robot has a
-$7\,\mathrm{in}\times5\,\mathrm{in}$ rectangular footprint; its forward arrow
-lies along the $5\,\mathrm{in}$ side, leaving the $7\,\mathrm{in}$ axis
-perpendicular to forward motion. The current software uses these dimensions to
-space coverage passes, but it does not yet perform continuous collision checks
-against rack geometry.
+\subsection{How to read feature status}
+
+\begin{itemize}
+    \item \textbf{Implemented}: code for the feature is present in the repository. This does not by itself mean it has been validated on physical hardware.
+    \item \textbf{Software checked}: a software-level check, such as a unit test or protocol round trip, covers the stated behavior. This does not establish physical performance.
+    \item \textbf{Hardware dependent}: the interface or calculation exists, but operation depends on board configuration, calibration, or hardware that is not yet supplied.
+    \item \textbf{Future work}: the feature is not implemented or is explicitly outside the current prototype boundary.
+\end{itemize}
+
+\subsection{Design ownership and AI-assisted development}
+
+The student is the system designer and engineering decision-maker. The student supplied the project goal and requirements, chose the mechanical and system-level constraints, described desired behavior, reviewed results, and directed revisions. Examples of student-led decisions include separating map routing from tile coverage, using the stated robot footprint to set nominal coverage spacing, selecting a desktop-to-ESP32 communication path, and requesting capabilities such as debugging USB communication, sending planned motion segments, and adding interface features.
+
+AI served as an implementation assistant in a role similar to a junior software engineer working from a mechanical engineer's requirements. The student translated engineering needs into software direction; AI helped turn that direction into code and documentation, refined interfaces, and iterated on issues identified during review. For example, the student directed the use of PySerial for the computer-to-board connection, pipe-delimited text packets built with Python f-strings, and an ESP32-to-ESP32 ESP-NOW bridge. AI assistance helped implement and debug those paths and add supporting controls and protocol behavior. The student remains responsible for the design choices, checking that the implementation matches the intended robot, and validating it against measured hardware. AI-generated code or calculations are not evidence of calibration or physical validation.
+
+The table records design and implementation ownership at the feature level. ``Student-led'' identifies the source of requirements and engineering intent; ``AI-assisted'' identifies implementation or refinement performed with AI under that direction. Both can apply to one feature.
 
 \begin{center}
-\begin{tabular}{ll}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.22\textwidth} >{\raggedright\arraybackslash}p{0.27\textwidth} >{\raggedright\arraybackslash}p{0.36\textwidth}}
 \toprule
-Subsystem & Responsibility \\
+\textbf{Feature} & \textbf{Design / implementation contribution} & \textbf{Current status}\\
 \midrule
-Map model & Cell occupancy, completed search cells, spill annotations \\
-Route planner & Select a reachable unsearched cell and find a shortest grid path \\
-Coverage planner & Generate ordered local waypoints for one cell \\
-Motion representation & Convert consecutive waypoints to pivot-and-drive records \\
-Execution layer & GUI simulation and command protocol; calibrated motor driver is absent \\
+Grid routing and target selection & Student-led planning requirements; AI-assisted Python implementation and refinement & Implemented in \texttt{route.py}; the app uses this software behavior.\\
+Within-tile coverage & Student-led footprint and coverage intent; AI-assisted waypoint implementation & Implemented in \texttt{search.py}; nominal footprint swath is an approximation, not a sensor measurement.\\
+Desktop GUI and mission coordination & Student-directed workflow and requested features; AI-assisted implementation and debugging & Implemented in \texttt{main.py}; visualization and simulation are software behavior.\\
+USB serial protocol & Student selected PySerial and line-oriented packet approach; AI-assisted formatting, connection, and debugging & Implemented in \texttt{serial\_link.py} and \texttt{serial\_protocol.py}; operation depends on the correct board, port, and firmware.\\
+ESP32 radio bridge and display & Student-directed ESP-NOW link and status-display requirements; AI-assisted firmware and integration & Firmware is present; board/channel/MAC setup and hardware checks are required.\\
+Robot segment and encoder-target logic & Student-directed motion interface and differential-drive requirements; AI-assisted implementation & Parsing and target calculation are implemented; physical motion is hardware dependent.\\
+Motor control, localization, leak sensing & Requirements identified as future engineering work & Future work; no configured motor driver, independent localization, or physical leak sensor is included.\\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\section{Map-level route selection}
+This attribution describes the development process for the current prototype, not a claim that every line was independently authored or physically verified by either contributor. As the project evolves, record meaningful changes by feature and update status only when the corresponding evidence exists.
 
-Let each cell be indexed by $(r,c)$, with $r$ increasing downward and $c$
-increasing rightward. The traversable set excludes rack and user-added obstacle
-cells. From the robot's current cell $s$, the planner considers every reachable
-cell that is neither blocked nor already searched. For each candidate $g$, a
-breadth-first search (BFS) finds a shortest path using only the four cardinal
-neighbors:
-\[
-  \mathcal{N}(r,c)=\{(r-1,c),(r+1,c),(r,c-1),(r,c+1)\}.
-\]
-The selected target is
-\[
-  g^*=\operatorname*{arg\,min}_{g\in U_{\mathrm{reachable}}}
-      \bigl(d_{\mathrm{BFS}}(s,g),\ r_g,\ c_g\bigr),
-\]
-where the row and column terms make equal-distance choices deterministic.
-The route is therefore shortest in grid steps for the selected target; it is
-not a globally optimal tour over all remaining cells. Transit cells are
-waypoints only. A tile is recorded as searched after its local pattern finishes.
+\section{System Overview}
 
-\section{Within-tile coverage}
+The Data Center Leak Assessment Robot (DCLAR) is a software prototype for planning a small robot's search through a gridded data-center floor. The program models server racks as blocked floor tiles, chooses a reachable tile to inspect, generates a coverage pattern inside that tile, and converts the resulting waypoints into pivot-and-drive motion segments.
 
-The local planner uses coordinates $(u,v)$ measured in tile widths from the
-tile's upper-left corner. Thus the tile occupies $0\leq u,v\leq1$; points
-outside this range are permitted so the robot footprint can extend across tile
-boundaries. For the zigzag pattern, the 7-inch lateral dimension gives a
-nominal swath width of $7\,\mathrm{in}$. A 2-inch overlap gives lane spacing
-\[
-  \Delta = 7\,\mathrm{in}-2\,\mathrm{in}=5\,\mathrm{in}.
-\]
-The generated path has two parallel sweeps on a 12-inch square, joined by
-orthogonal repositioning legs. At each corner, the robot pivots in place and
-then drives forward along the next segment. The circle-spiral option is a
-sampled outward path followed by a retrace toward its start.
+The desktop application is mainly a planning and visualization tool. It shows the route, animates the planned movement, allows spill locations to be annotated, and saves a JSON snapshot. It also has an optional communication path to an ESP32 radio bridge and a second ESP32 on the robot. The GUI is not itself a motor controller, and the system does not currently include a physical leak sensor or a configured encoder motor driver.
 
-The footprint-based swath is only a geometric approximation. A real search
-coverage model needs the sensor field of view, desired detection overlap,
-localization uncertainty, speed limits, and measured turning behavior.
+The main design idea is to keep the problem separated into smaller pieces. The route planner decides which tile to visit. The coverage planner decides where the robot should move inside that tile. The motion representation converts points into a sequence of turns and straight drives. The communication layer sends one segment at a time to the robot hardware.
 
-\section{Global motion-command vector}
+\subsection{System-Level Architecture}
 
-The map frame uses feet, with origin at the map's upper-left corner:
-\[
-  x=c+u,\qquad y=r+v.
-\]
-The display convention is $+x$ east/right and $+y$ south/down. A segment from
-$(x_i,y_i)$ to $(x_{i+1},y_{i+1})$ has length and desired heading
-\[
-  L_i=\sqrt{(x_{i+1}-x_i)^2+(y_{i+1}-y_i)^2},\qquad
-  \theta_i=\operatorname{atan2}(y_{i+1}-y_i,x_{i+1}-x_i).
-\]
-Given current heading $\theta_{i-1}$, the signed shortest pivot is
-\[
-  \Delta\theta_i=\operatorname{wrap}_{[-\pi,\pi)}(\theta_i-\theta_{i-1}).
-\]
-Each entry in the program's \texttt{movement\_command\_vector} contains
-\texttt{pivot\_angle\_degrees}, \texttt{global\_heading\_degrees},
-\texttt{target\_x\_ft}, \texttt{target\_y\_ft}, and
-\texttt{distance\_forward\_ft}. A physical low-level controller would need
-to execute the pivot, verify heading, drive toward the target, and verify
-position with encoders and/or localization sensors. The current animation
-illustrates this sequence and can serialize path segments, but does not
-provide a configured board-specific motor driver.
+\begin{figure}[H]
+\centering
+\fbox{
+\begin{minipage}{0.92\textwidth}
+\centering
+\vspace{5pt}
+\textbf{Desktop Mission Coordinator (\texttt{main.py})}\\
+\small Map state, Tkinter GUI, motion-command vector, spill annotations, JSON export
+\\[9pt]
+\begin{tabular}{c c}
+\textbf{Map Routing (\texttt{route.py})} &
+\textbf{Tile Coverage (\texttt{search.py})}\\
+\small BFS around blocked rack cells &
+\small Zigzag / circle-spiral waypoint generation\\
+\small Reachable unsearched tile selection &
+\small $7\,\mathrm{in}\times5\,\mathrm{in}$ footprint model
+\end{tabular}
+\\[10pt]
+$\downarrow$ \small{USB serial, newline-terminated text messages}
+\\[5pt]
+\fbox{\begin{minipage}{0.84\textwidth}\centering
+\textbf{Main-Control ESP32}\\
+\small USB serial interface, local PING/PONG, ESP-NOW radio bridge, TFT status display
+\end{minipage}}
+\\[8pt]
+$\downarrow$ \small{ESP-NOW wireless messages over a shared Wi-Fi channel}
+\\[5pt]
+\fbox{\begin{minipage}{0.84\textwidth}\centering
+\textbf{Robot ESP32}\\
+\small Segment receiver, differential-drive encoder target calculation, motor-driver interface
+\end{minipage}}
+\vspace{5pt}
+\end{minipage}
+}
+\caption{DCLAR software and hardware communication architecture. The robot-side motor driver must be calibrated and configured before physical motion is enabled.}
+\end{figure}
 
-\section{Spill annotation and saved data}
+\section{Subsystem Breakdown}
 
-Spill placement is a two-stage geometric input: choose a map cell, then choose
-a point in its enlarged local view. The point is stored as tile index $(r,c)$
-and normalized coordinates $(u_s,v_s)\in[0,1]^2$. Its map-frame position is
-\[
-  (x_s,y_s)=(c+u_s,\ r+v_s)\quad\text{feet}.
-\]
-Spill annotations are included in the JSON plan alongside rack layout,
-completed tile paths, route cells, and the current movement-command vector.
-In the simulator, the robot stops and latches when its map position comes
-within $3.5\,\mathrm{in}$ of an annotated spill point. The operator must
-acknowledge the stop before motion resumes; an acknowledged patch does not
-trigger another stop. This proximity rule demonstrates the stop behavior only:
-the program has no physical leak sensor, does not prioritize spill tiles, and
-does not mark a spill as resolved.
-
-\section{Physical-system development steps}
-
-Before using this plan on hardware, the following interfaces need explicit
-design and validation:
-\begin{enumerate}
-  \item A calibrated floor map and a footprint-aware obstacle-clearance check.
-  \item Sensor coverage and leak-detection logic, including confidence and
-        false-alarm handling.
-  \item A localization source that reports $(x,y,\theta)$ in the map frame.
-  \item Closed-loop pivot and forward-drive controllers with speed, stop, and
-        emergency-stop limits.
-  \item A mission state machine that distinguishes planned, executed,
-        interrupted, and verified search segments.
-  \item Data logging that records timestamps, robot pose, sensor observations,
-        commanded motion, and completion status for each waypoint.
-\end{enumerate}
-
-\section{Implementation map}
-
-\begin{itemize}
-  \item \texttt{route.py}: rack generation, BFS path reconstruction, and
-        nearest reachable unsearched-cell selection.
-  \item \texttt{search.py}: zigzag and circle-spiral waypoint generation and
-        map search-state storage.
-  \item \texttt{main.py}: simulation state, pivot-and-drive vector generation,
-        spill-point input, visualization, and JSON export.
-\end{itemize}
-
-\section{Software communication and state ownership}
-
-\texttt{main.py} is the coordinator. It imports functions from both planning
-modules and passes ordinary Python values between them. The modules do not
-communicate through a network, shared database, or hardware bus:
-\texttt{route.py} and \texttt{search.py} are called by \texttt{main.py}, and
-they do not call each other.
-
-At startup, \texttt{main.py} creates one \texttt{SearchGrid} instance. This
-object is the in-memory map-state container. The principal map state is:
 \begin{center}
-\begin{tabular}{lll}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.22\textwidth} >{\raggedright\arraybackslash}p{0.27\textwidth} >{\raggedright\arraybackslash}p{0.39\textwidth}}
 \toprule
-Python field & Type & Meaning \\
+\textbf{Subsystem} & \textbf{File or location} & \textbf{Responsibility}\\
 \midrule
-\texttt{rows}, \texttt{columns} & integers & Map dimensions in cells \\
-\texttt{obstacles} & set of $(r,c)$ & Rack cells and user-added blocked cells \\
-\texttt{searched} & set of $(r,c)$ & Cells whose complete local pattern finished \\
-\texttt{order} & list of $(r,c)$ & Completed cells in completion order \\
-\texttt{current\_cell} & $(r,c)$ & Last completed cell used as route origin \\
-\texttt{target\_cell} & $(r,c)$ or none & Cell whose local pattern is active \\
-\texttt{complete} & Boolean & Whether no reachable work remains \\
+Mission coordination & \texttt{main.py} & Owns the map state, runs the GUI, creates motion segments, handles completion messages, and saves the plan.\\
+Map routing & \texttt{route.py} & Represents rack cells as obstacles and uses BFS to find shortest four-direction paths.\\
+Tile coverage & \texttt{search.py} & Generates ordered zigzag or circle-spiral waypoints for one tile.\\
+USB communication & \texttt{serial\_link.py}, \texttt{serial\_protocol.py} & Finds serial ports, opens the desktop-to-ESP32 connection, and formats messages.\\
+Radio bridge & \texttt{esp32/esp32\_main\_control.py} & Receives USB serial lines, forwards commands over ESP-NOW, and relays robot replies.\\
+Robot receiver & \texttt{esp32/esp32\_robot\_control.py} & Receives path segments and calculates wheel encoder targets.\\
+Motion conversion & \texttt{esp32/robot\_motion.py} & Converts pivot angle and straight distance into signed wheel targets.\\
+Motor backend & \texttt{motor\_driver.py} interface & Must provide closed-loop wheel movement and stopping; hardware-specific implementation is not yet supplied.\\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\section{Hardware communication and path hand-off}
+\section{Map Routing}
 
-The planner modules remain ordinary data functions, while \texttt{main.py}
-owns the optional hardware link. The desktop sends one newline-terminated,
-pipe-delimited command over USB serial to \texttt{esp32\_main\_control.py}.
-That ESP32 answers \texttt{PING} locally and forwards other messages over
-ESP-NOW to the configured robot MAC on the shared Wi-Fi channel. Robot replies
-are relayed to the desktop as \texttt{RX|mac|message} and shown on the main
-board TFT.
+The floor is represented as a $10\times10$ grid of square cells. Each cell is $1\,\mathrm{ft}\times1\,\mathrm{ft}$. A cell is either available for travel or blocked by a server rack or a user-added obstacle.
 
-The desktop's USB check includes a correlation token. The manual GUI test
-uses tokens such as \texttt{GUI0022}; the automatic connect check uses tokens
-such as \texttt{APP0001}. The board returns the same token in
-\texttt{PONG|token}, allowing the desktop to match the response to its
-request. These prefixes and counters identify the source/request only; they
-are not robot addresses or movement commands.
+Each cell is indexed by $(r,c)$. The row index increases downward and the column index increases to the right. The four possible neighbors of a cell are
+\[
+\mathcal{N}(r,c)=
+\{(r-1,c),(r+1,c),(r,c-1),(r,c+1)\}.
+\]
 
-For planned movement, the desktop serializes each entry in
-\texttt{movement\_command\_vector} using the format
-\texttt{SEG|mission|sequence|pivot|distance|x|y|heading}. It sends a single
-segment, then waits for the matching \texttt{DONE|mission|sequence} before
-sending the next. The robot receiver parses the record, calculates
-differential-drive encoder targets, and reports \texttt{RECEIVED}, \texttt{PLAN},
-and then \texttt{DONE} after the configured motor driver returns. An
-\texttt{ERR} stops that mission. The desktop rejects stale mission IDs and
-sequence numbers; it marks the selected tile searched only when every segment
-in that mission has completed.
+The route planner uses breadth-first search (BFS). Since each move to a neighboring cell has the same cost, BFS finds a shortest path in number of grid steps. The coordinator checks reachable cells that have not yet been searched and selects the closest one. Equal-distance choices are made deterministic using row and column order.
 
-The current robot receiver deliberately requires an encoder-aware
-\texttt{motor\_driver.py}, measured wheel diameter, wheel-center track width,
-encoder ticks per wheel revolution, and a configured maximum wheel speed. A
-positive pivot angle is clockwise/right: the left wheel target is positive
-and the right wheel target is negative. Each wheel's in-place pivot arc has
-magnitude $t|\theta|/2$, for track width $t$ and angle $\theta$ in radians;
-straight travel gives equal wheel targets. These encoder targets do not
-constitute physical motion until a calibrated driver executes them. No motor
-pin mapping, encoder calibration, localization, or obstacle sensing is
-currently provided. A completed status therefore means the configured driver
-reported encoder completion; the desktop pose remains an odometry estimate.
+This is a nearest-target strategy, not a globally optimal tour of every remaining tile. The route between two cells is planned around blocked cells, but the current grid planner does not perform a continuous collision check using the full rectangular robot footprint.
 
-These row/column pairs use zero-based Python indices. Thus the upper-left cell
-is $(0,0)$ in memory but is reported as row 1, column 1 in saved JSON. A set
-stores unique membership efficiently; a list is used for \texttt{order}
-because order matters there. The GUI does not own a second map: drawing
-functions read these state values and render them on a canvas.
+Transit cells are only used to get to the selected target. They are not marked as searched just because the robot passes through them. A target tile is marked searched only after its local coverage pattern has completed.
 
-The hand-off for each target proceeds as follows:
-\begin{enumerate}
-  \item \texttt{main.py} calls
-        \texttt{nearest\_unsearched(current, searched, obstacles, rows, columns)}
-        in \texttt{route.py}. That function tests eligible cells with
-        \texttt{path\_between}, whose BFS returns a list of map cells from
-        start through goal.
-  \item \texttt{main.py} saves that list as \texttt{planned\_route}; its
-        entries after the start become \texttt{travel\_points}. Transit cells
-        are visited for travel but remain unsearched.
-  \item \texttt{main.py} calls \texttt{make\_search\_path(pattern)} in
-        \texttt{search.py}. It receives an ordered list of local $(u,v)$ tile
-        fractions. The animation converts a local point to global map feet by
-        $x=c+u$ and $y=r+v$ for target cell $(r,c)$.
-  \item Tkinter's scheduled \texttt{update\_search} callback advances the
-        robot pose a small amount per frame. Once every local point is reached,
-        \texttt{complete\_target()} adds the target to \texttt{searched} and
-        \texttt{order}; only then is another target selected.
-\end{enumerate}
+\section{Within-Tile Coverage Geometry}
 
-The live robot pose is held separately in \texttt{main.py}: continuous
-\texttt{robot\_row}, \texttt{robot\_column}, and \texttt{robot\_heading}
-values. This lets the dot move between cell centers. Other active plan state
-includes \texttt{path\_points} and \texttt{path\_index} for the current
-within-cell pattern, \texttt{travel\_points} for the map route still to
-travel, and \texttt{planned\_route} for its complete cell sequence.
+The nominal floor tile is $12\,\mathrm{in}\times12\,\mathrm{in}$. The modeled robot body is $7\,\mathrm{in}\times5\,\mathrm{in}$. Its forward direction lies along the $5\,\mathrm{in}$ side, so the $7\,\mathrm{in}$ dimension is perpendicular to forward motion.
 
-\section{Path data structures and persistence}
+For the zigzag pattern, the $7\,\mathrm{in}$ transverse dimension is treated as the nominal coverage swath. The planner uses two parallel passes separated by $5\,\mathrm{in}$. The overlap between the two nominal swaths is therefore
+\[
+w_{\mathrm{overlap}}=w_{\mathrm{swath}}-\Delta
+=7\,\mathrm{in}-5\,\mathrm{in}=2\,\mathrm{in}.
+\]
+This is equivalent to a $1\,\mathrm{in}$ overlap on either side of the lane center spacing. The two passes cover a nominal width of
+\[
+w_{\mathrm{covered}}=7\,\mathrm{in}+5\,\mathrm{in}=12\,\mathrm{in}.
+\]
 
-There are several distinct path representations rather than one universal
-path array:
+\begin{figure}[H]
+\centering
+\fbox{
+\begin{minipage}{0.86\textwidth}
+\centering
+\vspace{5pt}
+\begin{picture}(300,105)
+\put(50,8){\framebox(200,82){$12''\times12''$ floor tile}}
+\put(100,18){\line(0,1){62}}
+\put(103,52){\vector(0,1){10}}
+\put(68,94){\small Pass 1}
+\put(200,18){\line(0,1){62}}
+\put(203,52){\vector(0,-1){10}}
+\put(174,94){\small Pass 2}
+\put(82,38){\framebox(36,24){\small Robot}}
+\end{picture}
+\vspace{5pt}
+\end{minipage}
+}
+\caption{Simplified two-pass coverage geometry. The body footprint is used as a first approximation for the sensor swath, not as a measured sensor field of view.}
+\end{figure}
+
+The local pattern is stored using normalized tile coordinates $(u,v)$. The upper-left corner of a tile is $(0,0)$ and the lower-right corner is $(1,1)$. Values outside this range are allowed when the robot body needs to extend beyond the tile boundary during a turn or repositioning movement.
+
+The circle-spiral option is a sampled outward path followed by a retrace toward its start. The exact path is a geometric waypoint pattern; it does not represent a sensor's measured detection footprint.
+
+\section{Coordinate Frames and Motion Representation}
+
+The global map uses feet. The map origin is at the upper-left corner, with $+x$ to the right and $+y$ downward. For a local point $(u,v)$ inside tile $(r,c)$, the global position is
+\[
+x=c+u,\qquad y=r+v.
+\]
+This is why a tile center is located at $(c+0.5,r+0.5)$.
+
+For two consecutive global waypoints $(x_i,y_i)$ and $(x_{i+1},y_{i+1})$, the displacement is
+\[
+\Delta x_i=x_{i+1}-x_i,\qquad
+\Delta y_i=y_{i+1}-y_i.
+\]
+The straight-line distance and desired heading are
+\[
+L_i=\sqrt{(\Delta x_i)^2+(\Delta y_i)^2},
+\qquad
+\theta_i=\operatorname{atan2}(\Delta y_i,\Delta x_i).
+\]
+The heading is measured from the positive $x$ axis. Since the map's positive $y$ direction points down, positive angular rotation corresponds to clockwise rotation on the displayed map.
+
+If the robot's current heading is $\theta_{i-1}$, the required pivot is the shortest signed angular difference:
+\[
+\Delta\theta_i=
+\operatorname{wrap}_{[-\pi,\pi)}
+(\theta_i-\theta_{i-1}).
+\]
+The motion-command vector stores this as a pivot angle, target position, desired global heading, and forward distance. It is a high-level movement description. It is not a direct list of motor PWM values or encoder counts.
+
+\section{Differential-Drive Physics and Encoder Motion}
+
+The coverage planner gives the robot a list of points to visit. Those points describe where the robot should go, but they do not directly tell the wheels how far to rotate. The motion layer fills in that step. For each pair of consecutive points, the program determines which direction the robot should face and how far it should drive after turning.
+
+The current motion model uses a simple sequence: pivot in place, then drive forward. This makes each movement segment easy to describe and gives the robot a clear geometric target. It is an ideal model; the physical robot still needs encoder feedback and, ideally, an independent localization system.
+
+\subsection{From Two Waypoints to a Motion Segment}
+
+Suppose the robot is at $(x_i,y_i)$ and the next waypoint is $(x_{i+1},y_{i+1})$. The displacement is
+\[
+\Delta x=x_{i+1}-x_i,\qquad \Delta y=y_{i+1}-y_i.
+\]
+The straight-line distance follows from the Pythagorean theorem:
+\[
+L=\sqrt{(\Delta x)^2+(\Delta y)^2}.
+\]
+The desired heading is
+\[
+\theta_{\mathrm{target}}=\operatorname{atan2}(\Delta y,\Delta x).
+\]
+The two-argument arctangent is used because it returns the correct quadrant. A regular inverse tangent of $\Delta y/\Delta x$ would lose quadrant information and also has a problem when $\Delta x=0$.
+
+The map's vertical axis points down, so positive angle is clockwise when viewed on the screen. If the current heading is $\theta_{\mathrm{current}}$, the required pivot is the shortest signed angular difference:
+\[
+\Delta\theta=\operatorname{wrap}_{[-\pi,\pi)}(\theta_{\mathrm{target}}-\theta_{\mathrm{current}}).
+\]
+Wrapping the angle prevents the robot from taking a nearly full revolution when a smaller turn in the opposite direction reaches the same heading. The resulting command contains a pivot angle, a forward distance, a target position, and a desired heading. These are geometric instructions, not direct PWM values or encoder counts.
+
+\subsection{Pivoting in Place}
+
+The robot is modeled as a differential-drive vehicle with one independently driven wheel on each side. Let $t$ be the distance between the left and right wheel centerlines (the wheel track), and let $\theta$ be the pivot angle in radians.
+
+For an in-place pivot, the left and right wheels rotate in opposite directions. The robot center is intended to remain approximately fixed. Each wheel is a distance $t/2$ from the center of rotation, so each traces a circular arc with radius $t/2$. Arc length is radius multiplied by angle in radians:
+\[
+s=r\theta.
+\]
+Therefore, the magnitude of the travel distance for either wheel is
+\[
+|s_L|=|s_R|=\frac{t}{2}|\theta|.
+\]
+With the map convention used here, a positive clockwise/right pivot commands the left wheel forward and the right wheel backward. A negative pivot reverses those directions. This is why the wheel commands have opposite signs during a pivot. If both wheels moved forward by the same amount, the robot would travel straight instead of rotating in place.
+
+\subsection{Straight Driving}
+
+For a straight drive over distance $d$, both wheels travel the same distance in the same direction:
+\[
+s_L=s_R=d.
+\]
+If one wheel travels farther than the other, the robot curves instead of following a straight line. In a real system, small differences can come from wheel-diameter mismatch, friction, motor response, or encoder error.
+
+\subsection{Converting Wheel Distance into Encoder Ticks}
+
+An encoder measures wheel rotation, not distance directly. The program converts the desired wheel travel into wheel revolutions and then into encoder ticks. Let $D$ be the wheel diameter and $N$ be the encoder ticks per wheel revolution. One full wheel revolution travels the circumference
+\[
+C=\pi D.
+\]
+The encoder target magnitude for a wheel travel distance $s$ is
+\[
+n_{\mathrm{ticks}}=\frac{|s|}{\pi D}N.
+\]
+The magnitude gives the number of ticks, while the sign tells the motor which direction to turn. For a pivot, the wheel arc distance is used:
+\[
+n_{\mathrm{pivot}}=\frac{(t/2)|\theta|}{\pi D}N.
+\]
+The left and right targets have opposite signs. For a straight drive, use
+\[
+n_{\mathrm{drive}}=\frac{d}{\pi D}N
+\]
+for both wheels with the same sign.
+
+\subsection{Example Calculation}
+
+For illustration only, suppose the wheel track is $0.14\,\mathrm{m}$, the wheel diameter is $0.065\,\mathrm{m}$, the encoder scale is $360$ ticks per wheel revolution, and the robot needs to pivot $90^\circ$ clockwise. First convert the angle:
+\[
+\theta=90^\circ\frac{\pi}{180^\circ}=\frac{\pi}{2}\,\mathrm{rad}.
+\]
+The wheel arc distance is
+\[
+s=\frac{0.14}{2}\frac{\pi}{2}=0.10996\,\mathrm{m}.
+\]
+The wheel circumference is
+\[
+C=\pi(0.065)=0.20420\,\mathrm{m}.
+\]
+The tick magnitude is
+\[
+n_{\mathrm{ticks}}=\frac{0.10996}{0.20420}(360)\approx194\,\mathrm{ticks}.
+\]
+The ideal command is therefore approximately $+194$ ticks for the left wheel and $-194$ ticks for the right wheel under the positive-clockwise convention. These values are only an example; they are not DCLAR hardware calibration values.
+
+\subsection{Why the Dimensions Must Be Calibrated}
+
+The equations assume that the wheel diameter, wheel track, and encoder scale are known. If the wheel diameter is entered too large, the program predicts fewer wheel revolutions than the real robot needs for a given distance. If the wheel track is wrong, the calculated pivot angle will also be wrong.
+
+Even with careful measurements, the ideal model will not perfectly match the real floor. Possible sources of error include:
 \begin{itemize}
-  \item \texttt{planned\_route}: a list of integer $(row,column)$ map cells,
-        including the start and target. This is the route between tile centers.
-  \item \texttt{path\_points}: a list of floating-point $(u,v)$ fractions for
-        the active tile's local coverage pattern. Values may extend outside
-        $[0,1]$ to allow the body to pass the tile edge.
-  \item \texttt{movement\_command\_vector}: a list of dictionaries generated
-        by \texttt{motion\_commands\_from\_pose}. Each describes one upcoming
-        pivot-and-forward segment with pivot angle, desired heading, global
-        target $(x,y)$ in feet, distance, and action. This is a high-level
-        command representation, not motor-controller output.
-  \item \texttt{completed\_path\_records}: a list of records appended after a
-        tile's local path finishes. Each record identifies the 1-based tile,
-        pattern, local waypoints in feet, and segment vectors $(dx,dy)$,
-        distance, and heading.
+    \item wheel slip during acceleration or turning;
+    \item different effective wheel diameters;
+    \item backlash in the drivetrain;
+    \item uneven floor surfaces and changing friction;
+    \item encoder quantization or missed counts;
+    \item the robot not rotating exactly about its geometric center.
 \end{itemize}
 
-The **Save path plan** button calls \texttt{save\_path\_plan}. It serializes
-selected in-memory fields as JSON in \texttt{search\_path\_plan.json} beside
-\texttt{main.py}. JSON is plain text representing nested dictionaries and
-lists, so it can be opened in a text editor and consumed by another program.
-The file includes coordinate conventions, robot dimensions, rack layout,
-completed paths, the currently planned route and tile path, the current motion
-vector, spill patches, and simulated leak events. Spill patches are stored by
-integer tile index plus local fractions; their global position follows the
-same $x=c+u$, $y=r+v$ conversion.
+This is why the motor driver should use closed-loop encoder feedback. It should stop when the target is reached and also stop if a timeout or fault occurs. Encoder odometry estimates motion from wheel rotation; it is not the same as external localization. A camera, lidar, or another localization method would be needed to correct accumulated position error.
 
-The save is a snapshot, not automatic persistence: the application does not
-currently load the JSON file at startup, and the live tile state (including
-\texttt{searched}, \texttt{current\_cell}, and \texttt{target\_cell}) is not
-fully serialized as a restorable mission checkpoint. Therefore progress in
-memory is lost on exit unless a future load/checkpoint feature is added. Also,
-the saved JSON stores completed tile paths and current route/vector data, but
-does not by itself prove a physical robot executed them; execution status,
-timestamps, and sensor readings would need explicit logging fields.
+The wheel track is the distance between wheel centerlines. It is not the $7\,\mathrm{in}\times5\,\mathrm{in}$ robot body footprint. These are different measurements and should not be substituted for one another.
+
+\section{Hardware Communication and Execution}
+
+The desktop connects to the main-control ESP32 over USB serial. The main-control board forwards movement messages to the robot ESP32 over ESP-NOW. Both boards must use the same Wi-Fi channel, and the main-control board must be configured with the robot's MAC address.
+
+Messages are plain-text lines with fields separated by the pipe character \texttt{|}. The desktop sends one planned path segment at a time using
+\begin{lstlisting}
+SEG|mission_id|sequence|pivot_degrees|distance_ft|target_x_ft|target_y_ft|heading_degrees
+\end{lstlisting}
+
+The bridge forwards the segment. The robot can reply with \texttt{RECEIVED}, followed by a \texttt{PLAN} message containing calculated wheel targets, and then \texttt{DONE} after the configured motor backend reports completion. An \texttt{ERR} message indicates a failure. The desktop waits for the matching mission and sequence completion before sending the next segment.
+
+A \texttt{TX} message from the bridge only indicates that the radio send succeeded at the communication layer. It does not mean the robot completed the movement. The desktop advances the mission only after it receives the matching robot-side \texttt{DONE} response. The bridge relays messages but does not own the mission state.
+
+The USB connection can be checked separately using \texttt{PING} and \texttt{PONG}. The GUI uses request tokens such as \texttt{GUI0022} or \texttt{APP0001}; the ESP32 returns the same token. This checks the computer-to-bridge serial connection and does not require the robot to move.
+
+\subsection{Hardware Requirements Before Motion}
+
+Physical movement is intentionally disabled until the robot has:
+\begin{itemize}
+    \item measured wheel diameter and wheel-center track width;
+    \item measured encoder ticks per wheel revolution;
+    \item configured a maximum wheel speed;
+    \item supplied an encoder-aware \texttt{motor\_driver.py} with \texttt{move\_wheels(...)} and \texttt{stop()} functions;
+    \item verified timeout and fault handling, including stopping the motors if a command does not complete.
+\end{itemize}
+
+No motor pinout or motor-driver model is assumed. Without this hardware-specific implementation, the receiver should return a configuration error rather than attempting motion. The reported pose is commanded odometry, not an independent localization measurement. The current system also has no physical obstacle-safety model.
+
+\section{Spill Annotation and Simulated Stop}
+
+A spill is placed by first selecting a map tile and then choosing a point inside an enlarged tile view. The point is stored as a tile index $(r,c)$ and local coordinates $(u_s,v_s)$. Its global map position is
+\[
+x_s=c+u_s,\qquad y_s=r+v_s.
+\]
+
+In the simulator, the robot stops and latches a leak event when its position comes within $3.5\,\mathrm{in}$ of an annotated point. The operator must acknowledge the stop before the simulated motion resumes. An acknowledged patch does not trigger the same stop again.
+
+This is a demonstration of event handling, not leak detection. The program does not read a physical leak sensor, does not determine whether a spill is actually present, and does not mark a spill as physically resolved.
+
+\section{State Ownership and Saved Data}
+
+The \texttt{main.py} coordinator creates a \texttt{SearchGrid} object and owns the active mission state. The routing and coverage modules are called by the coordinator and exchange ordinary Python values; they do not communicate directly with one another.
+
+The main map state includes dimensions, obstacle cells, searched cells, completion order, current cell, and active target. The live robot pose and active waypoint indices are also maintained by \texttt{main.py}. The GUI reads this state and draws it; it does not maintain a separate map model.
+
+There are several path representations:
+\begin{itemize}
+    \item \texttt{planned\_route}: integer map cells from the route start to the selected target;
+    \item \texttt{path\_points}: local $(u,v)$ waypoints for the active tile;
+    \item \texttt{movement\_command\_vector}: high-level pivot-and-drive records in global feet and degrees;
+    \item \texttt{completed\_path\_records}: records of completed tile patterns and their segment geometry.
+\end{itemize}
+
+The \textbf{Save path plan} button writes a JSON snapshot to \texttt{search\_path\_plan.json}. It includes map geometry, route and path information, movement vectors, and spill annotations. It is a diagnostic snapshot, not a resumable checkpoint. The application does not currently reload the file at startup, and the saved plan alone does not prove that a physical robot executed the path.
+
+\section{Software Setup, ESP32 Deployment, and Testing}
+
+\subsection{Desktop Application}
+
+Run the desktop application from the project directory so that its Python modules can be imported. Install the dependencies listed in \texttt{requirements.txt}, then launch \texttt{main.py}:
+
+\begin{lstlisting}[language=bash]
+python -m pip install -r requirements.txt
+python main.py
+\end{lstlisting}
+
+On a Windows installation where the project uses Python 3.12, the same interpreter should be used for both dependency installation and launching the application:
+
+\begin{lstlisting}[language=bash]
+py -3.12 -m pip install -r requirements.txt
+py -3.12 .\\main.py
+\end{lstlisting}
+
+A package installed for one Python interpreter is not automatically available to another. In the GUI, identify the ESP32 entry in the COM-port list. COM numbers can change when devices are reconnected. The application can use a token-based PING/PONG exchange to identify the correct board. Close Thonny's serial connection before connecting from the desktop application because two programs cannot use the same COM port at the same time.
+
+\subsection{Main-Control ESP32 Setup}
+
+The main-control ESP32 runs MicroPython and acts as the USB-to-ESP-NOW bridge. In Thonny, select the MicroPython ESP32 interpreter and the board's COM port. Copy the bridge program and its display dependencies to the device root:
+\begin{itemize}
+    \item \texttt{esp32/esp32\_main\_control.py};
+    \item \texttt{esp32/board\_display.py};
+    \item \texttt{st7789py.py};
+    \item \texttt{vga1\_16x32.py}.
+\end{itemize}
+
+Save \texttt{esp32\_main\_control.py} on the device as \texttt{/main.py} so it starts after reset. The other listed files should also be in the device root. Set \texttt{WIFI\_CHANNEL} to the channel used by the robot and replace \texttt{ROBOT\_MAC} with the robot's six-byte MAC address. After reset, the serial output should report \texttt{READY|channel|mac}. If the board returns to the MicroPython REPL prompt instead, the bridge loop is not running.
+
+The display configuration in the firmware uses the Feather ESP32-S3 TFT pin assignments: power GPIO21, CS GPIO7, DC GPIO39, reset GPIO40, backlight GPIO45, and SPI SCK/MOSI GPIO36/GPIO35. These are firmware configuration details and should be checked against the actual board before wiring.
+
+\subsection{Robot ESP32 Setup}
+
+Copy \texttt{esp32/esp32\_robot\_control.py} and \texttt{esp32/robot\_motion.py} to the robot ESP32 root using Thonny. Both ESP32 boards must use the same \texttt{WIFI\_CHANNEL}. The main-control board must contain the robot's MAC address. The robot receiver learns the main-control board's MAC from its first radio packet.
+
+\subsection{Communication Checks and Direct Test Message}
+
+The USB connection can be tested without moving the robot. A manual GUI ping uses a token such as
+\begin{lstlisting}
+PING|GUI0022
+PONG|GUI0022
+\end{lstlisting}
+The automatic connection check uses a token such as \texttt{APP0001}. The ESP32 returns the same token. These tokens identify a request and its source; they are not robot IDs, MAC addresses, or movement commands. PING/PONG is handled locally by the main-control ESP32 and only checks the computer-to-board serial connection.
+
+The control/communication test window also supports a direct \texttt{MOVE} line:
+\begin{lstlisting}
+MOVE|2|1.25|3.50|90.0|DRIVE
+\end{lstlisting}
+The fields are task ID, target $x$ and $y$ in feet, heading in degrees (or \texttt{AUTO}), and instruction (\texttt{DRIVE} or \texttt{TURN}). \texttt{DRIVE} heads toward the target; a numeric heading must agree within the configured three-degree tolerance. \texttt{TURN} pivots in place to the requested heading. A direct \texttt{TASK} command is rejected with \texttt{PATH\_SEGMENTS\_REQUIRED}; planner output should be sent using the planned-path interface.
+
+\subsection{Testing Order}
+
+Testing should proceed from software-only checks toward hardware checks:
+\begin{enumerate}
+    \item Run the Python tests for serial protocol formatting and motion-target calculations.
+    \item Run the desktop application and check the map, target selection, and local coverage patterns.
+    \item Inspect the movement-command vector for the expected pivot angle, heading, target coordinates, and forward distance.
+    \item Connect the main-control ESP32 and confirm that the matching PONG token is returned by \textbf{Connect + identify}.
+    \item Use the manual \textbf{Ping ESP32} control and confirm that the same GUI token is returned.
+    \item With both ESP32 boards configured to the same channel, confirm that a robot message is received and relayed as an \texttt{RX} line.
+    \item Test the robot receiver with the motor backend disabled or safely disconnected. Confirm that it parses segments and reports the expected encoder targets.
+    \item Only after calibration, motor-driver implementation, and safe bench testing should physical movement be enabled.
+\end{enumerate}
+
+A successful USB PING/PONG, radio \texttt{TX}, or calculated \texttt{PLAN} is not proof of physical movement. Each checks a different layer of the system.
+
+\section{Current Scope and Next Engineering Steps}
+
+The current prototype demonstrates map routing, tile-level coverage geometry, coordinate transformations, pivot-and-drive command generation, a serial/radio communication path, and mission completion handling. It does not yet demonstrate validated autonomous leak inspection on a physical robot.
+
+The next engineering steps are:
+\begin{enumerate}
+    \item Calibrate the floor map and add footprint-aware clearance checks around racks.
+    \item Measure the sensor field of view and define a real coverage requirement, including overlap and localization error.
+    \item Add a localization source for $(x,y,\theta)$ in the global map frame.
+    \item Implement and test the encoder-aware motor driver with speed, timeout, and emergency-stop behavior.
+    \item Validate pivot and straight-drive performance on the actual floor, including slip and turning error.
+    \item Add physical leak-sensor logic and a method for handling false alarms.
+    \item Log timestamps, measured pose, sensor readings, commands, and completion status for each segment.
+    \item Add mission checkpoint loading if missions need to resume after the application closes.
+\end{enumerate}
+
+\section{Summary}
+
+DCLAR separates the inspection problem into map routing, local tile coverage, motion representation, mission coordination, and hardware communication. BFS selects a reachable unsearched tile, the coverage planner generates local waypoints, and the motion layer turns consecutive points into pivots and straight drives. The ESP32 bridge forwards one segment at a time, while the desktop waits for a matching robot completion message before advancing.
+
+The geometry and communication interfaces are in place as a prototype. Physical performance still depends on measured robot parameters, a configured motor driver, localization, sensor validation, and safety testing.
 
 \end{document}
