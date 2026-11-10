@@ -69,7 +69,7 @@ Desktop GUI and mission coordination & Student-directed workflow and requested f
 USB serial protocol & Student selected PySerial and line-oriented packet approach; AI-assisted formatting, connection, and debugging & Implemented in \texttt{serial\_link.py} and \texttt{serial\_protocol.py}; operation depends on the correct board, port, and firmware.\\
 ESP32 radio bridge and display & Student-directed ESP-NOW link and status-display requirements; AI-assisted firmware and integration & Firmware is present; board/channel/MAC setup and hardware checks are required.\\
 Robot segment and encoder-target logic & Student-directed motion interface and differential-drive requirements; AI-assisted implementation & Parsing and target calculation are implemented; physical motion is hardware dependent.\\
-Motor control, localization, leak sensing & Requirements identified as future engineering work & Future work; no configured motor driver, independent localization, or physical leak sensor is included.\\
+Motor control, localization, leak sensing & Student-led motion-control concept; AI-assisted documentation and interface refinement & Encoder-feedback/PWM bridge pipeline is a design intent; motor bridge, motor driver, localization, and leak sensing remain future work.\\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -316,6 +316,41 @@ The tick magnitude is
 n_{\mathrm{ticks}}=\frac{0.10996}{0.20420}(360)\approx194\,\mathrm{ticks}.
 \]
 The ideal command is therefore approximately $+194$ ticks for the left wheel and $-194$ ticks for the right wheel under the positive-clockwise convention. These values are only an example; they are not DCLAR hardware calibration values.
+
+\subsection{From Encoder Targets to Motor Voltage and PWM}
+
+The designed control pipeline starts with a geometric target, such as ``drive forward $d$ feet'' or ``pivot by $\Delta\theta$.'' The planner converts that target into left- and right-wheel distances, then into signed encoder tick targets using the measured wheel diameter, wheel track, and encoder resolution described above. The tick targets specify how far each wheel should rotate; they do not specify a motor voltage or PWM duty cycle.
+
+The intended electrical arrangement uses a battery as the motor-power source and a motor bridge (H-bridge) to switch that power to each motor. In a typical arrangement, the battery positive and return connect to the bridge's motor-supply and power-ground terminals, the motors connect to the bridge outputs, and ESP32 GPIO signals connect only to the bridge's logic inputs. The ESP32 and bridge need a shared logic reference/ground, and the bridge must be compatible with the controller's logic voltage. The exact wiring depends on the selected bridge module and its datasheet. The battery is not connected to an ESP32 GPIO, and the motors are not powered from an ESP32 pin.
+
+PWM (pulse-width modulation) is a control waveform sent to a bridge input such as an enable/PWM pin. It is not the battery supply and does not itself provide motor power. The bridge rapidly switches the battery-powered motor output; changing the PWM duty ratio $q$ changes the approximate average voltage applied to the motor. For example, the TI DRV8876N documentation shows the controller's PWM/direction inputs separately from the motor supply $V_M$; this is an example of the interface, not a selected DCLAR component (\href{https://www.ti.com/lit/ds/symlink/drv8876n.pdf}{TI DRV8876N datasheet}). In a simplified model,
+\[
+V_{\mathrm{motor,avg}}\approx q V_{\mathrm{battery}},\qquad 0\le q\le1,
+\]
+with direction selected by the bridge's direction/polarity inputs. This approximation ignores voltage drops in the bridge, battery sag, motor inductance, and switching behavior. A PWM signal therefore controls the motor's applied power level through the driver; it is not a direct distance command. ESP32 PWM peripherals can generate such control waveforms (see the \href{https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/ledc.html}{Espressif LEDC documentation}), but the correct pins, frequency, duty range, and bridge input mode depend on the hardware selected.
+
+Motor voltage alone cannot reliably determine travel distance. A simplified DC motor model is
+\[
+V_{\mathrm{motor}}=R i + L\frac{di}{dt}+K_e\omega,
+\qquad \tau=K_t i,
+\]
+where current $i$ produces torque $\tau$, while angular speed $\omega$ creates back-EMF. The speed and resulting distance also depend on load, wheel traction, battery voltage under load, friction, and motor variation. The same nominal voltage can produce different motion, and a motor can stall while voltage is present. DCLAR therefore derives the requested distance from map geometry and uses encoder feedback to measure wheel rotation; it does not infer distance from the battery voltage.
+
+The intended closed-loop driver compares each wheel's measured encoder count with its target. The count error is used to adjust PWM duty (and thus motor speed/torque) while the bridge selects direction. The driver reduces or stops drive as the target is reached, stops both motors on timeout or fault, and reports completion only after both wheel targets complete. Distance can then be estimated from measured encoder counts:
+\[
+d_{\mathrm{measured}}=\frac{|n_{\mathrm{measured}}|}{N}\pi D,
+\]
+where $N$ is encoder ticks per wheel revolution and $D$ is the calibrated loaded wheel diameter. This estimate is wheel odometry and can drift if the wheels slip.
+
+For a straight-drive example using the illustrative $D=65\,\mathrm{mm}$ and $N=360$ values above, a $0.5\,\mathrm{ft}$ target becomes $152.4\,\mathrm{mm}$ and approximately
+\[
+n_{\mathrm{target}}=\frac{152.4}{\pi(65)}(360)\approx269\,\mathrm{ticks}
+\]
+for each wheel. The motor driver would then use encoder feedback and PWM to reach those two tick targets. The $9\,\mathrm{V}$ supply does not appear in this distance-to-ticks calculation; it supplies energy to the bridge and affects available motor speed and torque.
+
+For DCLAR, a nominal $9\,\mathrm{V}$ battery would be a candidate motor supply only if the motor's rated voltage and stall current, the battery's ability to supply that current, and the bridge's operating-voltage/current/thermal ratings are all compatible. The battery connects to the bridge motor-supply input, not as an ``input voltage'' that the ESP32 converts into a travel distance. Do not assume a battery labeled $9\,\mathrm{V}$ can provide the required motor current; verify its datasheet and the motor's stall current before selecting it. No battery, motor, bridge, PWM setting, or current limit is selected or validated in the current repository.
+
+This describes the student's intended physics/control pipeline: map distance and heading become wheel travel, wheel travel becomes encoder targets, encoder feedback closes the motion loop, and PWM-controlled bridge outputs apply battery power to the motors. The design contribution is the target-distance-to-wheel-motion concept and the intended encoder-feedback/PWM bridge pipeline; component selection and hardware calibration remain open engineering work. The current firmware implements the geometry-to-tick conversion only. It does not yet generate PWM, measure encoders, or drive an H-bridge.
 
 \subsection{Why the Dimensions Must Be Calibrated}
 
