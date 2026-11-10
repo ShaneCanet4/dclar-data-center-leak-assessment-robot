@@ -14,8 +14,8 @@ planner; it is not a robot controller or a leak sensor.
 | Tile coverage | `search.py` | Creates zigzag or circle-spiral waypoints inside and beyond a selected 1 ft tile, using the 7 in × 5 in robot footprint. |
 | Simulation and data | `main.py` | Animates pivot-in-place and forward-only motion, accepts spill locations, shows the current command vector, and saves a JSON plan. |
 | USB serial link | `serial_link.py`, `serial_protocol.py` | Lists COM ports, connects the desktop app to the main-control ESP32, and formats text commands. |
-| ESP32 radio bridge and robot receiver | `esp32/` | Main-control USB/TFT bridge, robot ESP-NOW receiver, and differential-drive path-to-encoder translator. |
-| Communication checks | `test_serial_protocol.py`, `test_robot_motion.py`, `test_esp32_communication.py` | Unit-checks message and wheel-target formatting and tests USB PING/PONG. |
+| ESP32 radio bridge and robot receiver | `esp32/` | Main-control USB/TFT bridge, robot ESP-NOW receiver, and differential-drive motion-segment receiver; timed motor control is planned but not implemented. |
+| Communication checks | `test_serial_protocol.py`, `test_robot_motion.py`, `test_esp32_communication.py` | Unit-checks message formatting and the current motion-calculation placeholder, and tests USB PING/PONG. |
 | Living system architecture | `docs/system_design.tex` | Detailed architecture and data-flow description, current feature status, student design ownership, AI-assisted implementation contributions, and hardware limitations. Update this document alongside meaningful feature changes. |
 
 ## ESP32 main-control bridge
@@ -130,29 +130,11 @@ The desktop sends each planned vector entry as a simple f-string encoded line:
 SEG|mission_id|sequence|pivot_degrees|distance_ft|target_x_ft|target_y_ft|heading_degrees
 ```
 
-The bridge forwards the line over ESP-NOW. The robot replies
-`RECEIVED|mission|sequence`, reports calculated encoder targets as
-`PLAN|mission|sequence|pivot:left_ticks:right_ticks,drive:left_ticks:right_ticks`,
-then sends `DONE|mission|sequence` after its motor backend succeeds. Failures
-return `ERR|mission|sequence|reason`. The desktop waits for matching `DONE`
-before it sends the next segment; only the final completion advances the map.
+The bridge forwards the line over ESP-NOW. The current robot firmware parses motion segments but does not implement the intended open-loop timed PWM control. It still contains an earlier wheel-target placeholder and expects a separate motor backend; no motor commands should be treated as physical execution yet.
 
-`robot_motion.py` translates pivot-and-drive segments into signed wheel encoder
-targets. Positive angle means clockwise/right in the map: left wheel forward,
-right wheel backward. For pivot angle `a` and wheel-center track `t`, each
-wheel travels `t * radians(a) / 2`; convert that arc using tire circumference
-and encoder ticks per revolution. A straight drive gives both wheels equal
-positive ticks. Negative angles reverse the turn. Wheel track is the distance
-between wheel centerlines, not the 7 x 5 inch body size.
+The intended design has no wheel-motion feedback. For straight travel, measure the assembled robot's average speed at a chosen PWM setting and estimate run time with `time = distance / measured_speed`. For a pivot, measure its average turn rate and estimate `time = abs(turn_angle) / measured_turn_rate`. ENA/ENB or equivalent driver inputs receive PWM/direction logic; the battery powers the motor driver's supply input, and the driver switches power to the motors. PWM controls the approximate applied motor power, while timed calibration estimates distance. A nominal 9 V battery must be checked against the motor and driver voltage/current ratings and the motor's startup/stall current.
 
-Physical movement remains disabled until wheel diameter, wheel track, encoder
-ticks per wheel revolution, and maximum wheel speed are measured/configured in
-`esp32_robot_control.py`, and an encoder-aware `motor_driver.py` supplies
-`move_wheels(left_ticks, right_ticks, max_speed_mm_s, timeout_ms)` and `stop()`.
-It must stop on timeout/fault and return only after closed-loop completion.
-No motor pinout or driver model has been assumed. Without that setup, the
-receiver returns a configuration error instead of moving. The reported pose
-is commanded odometry, not localization; there is no obstacle safety model.
+Because this is open loop, elapsed time does not confirm that the robot reached its target. Battery sag, floor friction, load, startup delay, and motor differences can change the distance and turn. The map pose is only the commanded estimate. Hardware-specific timed PWM execution, calibration, and safe stop behavior remain to be implemented.
 
 The app's **Ping ESP32** button sends `PING|GUI####`, where `####` is an
 app-local counter (for example, `PING|GUI0022`). The `GUI` prefix identifies
@@ -238,14 +220,16 @@ This check requires the robot ESP32 to be powered, configured on the same
 channel, and running firmware that understands the text protocol.
 
 1. Connect the computer to the main-control ESP32 as above.
-2. Use **Send planned path**. Verify each `SEG` is followed by `RECEIVED`,
-   `PLAN`, and matching `DONE` relayed as `RX|mac|...`. The next segment must
-   wait for `DONE`; stale mission/sequence replies should be ignored.
+2. Check bridge-to-robot radio communication using the radio ping supported by
+   the robot firmware. A `TX` line confirms only that the main ESP32 sent a
+   packet; a matching robot reply confirms the radio round trip.
+3. Do not treat a planned `SEG` as motor execution. The current robot firmware
+   has no timed PWM driver and may reply with `ERR` when motion configuration
+   is missing. The open-loop timed motor implementation is future work.
 
-Pass condition: matching robot replies are visible on both main board and
-desktop. `TX` alone only means the main ESP32 reported a successful radio send.
-Motion completion requires measured geometry and a configured motor driver;
-otherwise the robot should return a clear setup error.
+Pass condition: the matching radio-ping reply is visible on the main board and
+in the desktop log. When timed motor control is implemented, `DONE` will mean
+the requested timer elapsed, not that the robot reached its planned location.
 
 #### 5. Validate path completion behavior
 

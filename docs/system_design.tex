@@ -68,8 +68,8 @@ Within-tile coverage & Student-led footprint and coverage intent; AI-assisted wa
 Desktop GUI and mission coordination & Student-directed workflow and requested features; AI-assisted implementation and debugging & Implemented in \texttt{main.py}; visualization and simulation are software behavior.\\
 USB serial protocol & Student selected PySerial and line-oriented packet approach; AI-assisted formatting, connection, and debugging & Implemented in \texttt{serial\_link.py} and \texttt{serial\_protocol.py}; operation depends on the correct board, port, and firmware.\\
 ESP32 radio bridge and display & Student-directed ESP-NOW link and status-display requirements; AI-assisted firmware and integration & Firmware is present; board/channel/MAC setup and hardware checks are required.\\
-Robot segment and encoder-target logic & Student-directed motion interface and differential-drive requirements; AI-assisted implementation & Parsing and target calculation are implemented; physical motion is hardware dependent.\\
-Motor control, localization, leak sensing & Student-led motion-control concept; AI-assisted documentation and interface refinement & Encoder-feedback/PWM bridge pipeline is a design intent; motor bridge, motor driver, localization, and leak sensing remain future work.\\
+Robot segment and motion timing & Student-directed motion interface and open-loop motor-control concept & Geometric segment parsing is present; timed PWM execution is planned but not implemented.\\
+Motor control, localization, leak sensing & Student-led open-loop PWM and timed-motion concept; AI-assisted documentation and interface refinement & Timed PWM control is the intended approach; driver wiring, timing calibration, localization, and leak sensing remain future work.\\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -80,7 +80,7 @@ This attribution describes the development process for the current prototype, no
 
 The Data Center Leak Assessment Robot (DCLAR) is a software prototype for planning a small robot's search through a gridded data-center floor. The program models server racks as blocked floor tiles, chooses a reachable tile to inspect, generates a coverage pattern inside that tile, and converts the resulting waypoints into pivot-and-drive motion segments.
 
-The desktop application is mainly a planning and visualization tool. It shows the route, animates the planned movement, allows spill locations to be annotated, and saves a JSON snapshot. It also has an optional communication path to an ESP32 radio bridge and a second ESP32 on the robot. The GUI is not itself a motor controller, and the system does not currently include a physical leak sensor or a configured encoder motor driver.
+The desktop application is mainly a planning and visualization tool. It shows the route, animates the planned movement, allows spill locations to be annotated, and saves a JSON snapshot. It also has an optional communication path to an ESP32 radio bridge and a second ESP32 on the robot. The GUI is not itself a motor controller, and the system does not currently include a physical leak sensor or a configured motor driver.
 
 The main design idea is to keep the problem separated into smaller pieces. The route planner decides which tile to visit. The coverage planner decides where the robot should move inside that tile. The motion representation converts points into a sequence of turns and straight drives. The communication layer sends one segment at a time to the robot hardware.
 
@@ -115,7 +115,7 @@ $\downarrow$ \small{ESP-NOW wireless messages over a shared Wi-Fi channel}
 \\[5pt]
 \fbox{\begin{minipage}{0.84\textwidth}\centering
 \textbf{Robot ESP32}\\
-\small Segment receiver, differential-drive encoder target calculation, motor-driver interface
+\small Segment receiver, open-loop timing calculation, motor-driver interface
 \end{minipage}}
 \vspace{5pt}
 \end{minipage}
@@ -135,9 +135,9 @@ Map routing & \texttt{route.py} & Represents rack cells as obstacles and uses BF
 Tile coverage & \texttt{search.py} & Generates ordered zigzag or circle-spiral waypoints for one tile.\\
 USB communication & \texttt{serial\_link.py}, \texttt{serial\_protocol.py} & Finds serial ports, opens the desktop-to-ESP32 connection, and formats messages.\\
 Radio bridge & \texttt{esp32/esp32\_main\_control.py} & Receives USB serial lines, forwards commands over ESP-NOW, and relays robot replies.\\
-Robot receiver & \texttt{esp32/esp32\_robot\_control.py} & Receives path segments and calculates wheel encoder targets.\\
-Motion conversion & \texttt{esp32/robot\_motion.py} & Converts pivot angle and straight distance into signed wheel targets.\\
-Motor backend & \texttt{motor\_driver.py} interface & Must provide closed-loop wheel movement and stopping; hardware-specific implementation is not yet supplied.\\
+Robot receiver & \texttt{esp32/esp32\_robot\_control.py} & Receives path segments; current motor execution is not implemented.\\
+Motion conversion & \texttt{esp32/robot\_motion.py} & Contains an earlier wheel-target placeholder; planned control converts distance/turn into motor run times.\\
+Motor backend & \texttt{motor\_driver.py} interface & Planned to set direction/PWM and stop after calibrated run times; hardware-specific implementation is not yet supplied.\\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -225,150 +225,71 @@ If the robot's current heading is $\theta_{i-1}$, the required pivot is the shor
 \operatorname{wrap}_{[-\pi,\pi)}
 (\theta_i-\theta_{i-1}).
 \]
-The motion-command vector stores this as a pivot angle, target position, desired global heading, and forward distance. It is a high-level movement description. It is not a direct list of motor PWM values or encoder counts.
+The motion-command vector stores this as a pivot angle, target position, desired global heading, and forward distance. It is a high-level movement description. It is not a direct list of motor PWM values or run times.
 
-\section{Differential-Drive Physics and Encoder Motion}
+\section{Differential-Drive Physics and Open-Loop Motor Control}
 
-The coverage planner gives the robot a list of points to visit. Those points describe where the robot should go, but they do not directly tell the wheels how far to rotate. The motion layer fills in that step. For each pair of consecutive points, the program determines which direction the robot should face and how far it should drive after turning.
+The planner represents motion as a sequence of geometric segments: pivot in place, then drive forward. The planned distance and angle describe the desired motion. Since the robot has no wheel feedback, the intended physical controller will estimate how long to run the motors using empirical speed measurements at a selected PWM setting. It will not measure whether the requested distance was actually reached.
 
-The current motion model uses a simple sequence: pivot in place, then drive forward. This makes each movement segment easy to describe and gives the robot a clear geometric target. It is an ideal model; the physical robot still needs encoder feedback and, ideally, an independent localization system.
+\subsection{From Waypoints to Wheel Motion}
 
-\subsection{From Two Waypoints to a Motion Segment}
-
-Suppose the robot is at $(x_i,y_i)$ and the next waypoint is $(x_{i+1},y_{i+1})$. The displacement is
+For consecutive waypoints $(x_i,y_i)$ and $(x_{i+1},y_{i+1})$, calculate
 \[
-\Delta x=x_{i+1}-x_i,\qquad \Delta y=y_{i+1}-y_i.
+\Delta x=x_{i+1}-x_i,\qquad \Delta y=y_{i+1}-y_i,
 \]
-The straight-line distance follows from the Pythagorean theorem:
 \[
-L=\sqrt{(\Delta x)^2+(\Delta y)^2}.
-\]
-The desired heading is
-\[
+d=\sqrt{(\Delta x)^2+(\Delta y)^2},\qquad
 \theta_{\mathrm{target}}=\operatorname{atan2}(\Delta y,\Delta x).
 \]
-The two-argument arctangent is used because it returns the correct quadrant. A regular inverse tangent of $\Delta y/\Delta x$ would lose quadrant information and also has a problem when $\Delta x=0$.
+The required turn is the shortest signed difference between the target heading and the robot's estimated current heading. With the map's positive $y$ axis pointing down, a positive turn is clockwise on the map.
 
-The map's vertical axis points down, so positive angle is clockwise when viewed on the screen. If the current heading is $\theta_{\mathrm{current}}$, the required pivot is the shortest signed angular difference:
+Let $b$ be the distance between the left and right wheel centerlines (track width). An ideal in-place pivot through angle $\theta$ requires each wheel to travel an arc of magnitude
 \[
-\Delta\theta=\operatorname{wrap}_{[-\pi,\pi)}(\theta_{\mathrm{target}}-\theta_{\mathrm{current}}).
+|s_L|=|s_R|=\frac{b}{2}|\theta|,
 \]
-Wrapping the angle prevents the robot from taking a nearly full revolution when a smaller turn in the opposite direction reaches the same heading. The resulting command contains a pivot angle, a forward distance, a target position, and a desired heading. These are geometric instructions, not direct PWM values or encoder counts.
+with opposite wheel directions. For a straight drive of distance $d$, both wheels run forward together. These equations describe ideal differential-drive geometry; actual turns and distances will differ due to wheel slip and mismatched motors.
 
-\subsection{Pivoting in Place}
+\subsection{Open-Loop Run-Time Estimate}
 
-The robot is modeled as a differential-drive vehicle with one independently driven wheel on each side. Let $t$ be the distance between the left and right wheel centerlines (the wheel track), and let $\theta$ be the pivot angle in radians.
+PWM (pulse-width modulation) is the control waveform to the motor driver's ENA/ENB or equivalent inputs. The battery supplies motor power to the driver's motor-supply terminals; the ESP32 sends low-voltage direction and PWM logic signals to the driver. ENA and ENB commonly enable or PWM the two motor channels, but the exact pin behavior depends on the selected driver board. The motors connect to the driver's output terminals, not directly to ESP32 GPIO pins. The controller ground and driver logic ground must be connected as required by that board's datasheet.
 
-For an in-place pivot, the left and right wheels rotate in opposite directions. The robot center is intended to remain approximately fixed. Each wheel is a distance $t/2$ from the center of rotation, so each traces a circular arc with radius $t/2$. Arc length is radius multiplied by angle in radians:
+For a PWM duty ratio $q$ between 0 and 1, the average motor voltage is approximately
 \[
-s=r\theta.
+V_{\mathrm{motor,avg}}\approx qV_{\mathrm{battery}}.
 \]
-Therefore, the magnitude of the travel distance for either wheel is
+This is an approximation: driver voltage drops, battery sag, motor load, and friction affect actual speed. PWM controls the motor driver's switching; it does not directly encode a distance. The TI DRV8876N datasheet illustrates the general separation between PWM/direction control inputs and the motor supply (it is not a selected DCLAR component; \href{https://www.ti.com/lit/ds/symlink/drv8876n.pdf}{datasheet}). The ESP32 can generate PWM waveforms with its LEDC peripheral (\href{https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/ledc.html}{Espressif documentation}); exact pins and settings depend on the firmware and bridge selected.
+
+Because the robot has no wheel sensors, run time must be estimated from measured open-loop speed. For a straight drive, first measure the robot's average linear speed $v_{\mathrm{cal}}(q)$ at the chosen duty ratio, battery condition, and floor surface. Then estimate the motor-on time as
 \[
-|s_L|=|s_R|=\frac{t}{2}|\theta|.
+T_{\mathrm{drive}}=\frac{d}{v_{\mathrm{cal}}(q)}.
 \]
-With the map convention used here, a positive clockwise/right pivot commands the left wheel forward and the right wheel backward. A negative pivot reverses those directions. This is why the wheel commands have opposite signs during a pivot. If both wheels moved forward by the same amount, the robot would travel straight instead of rotating in place.
-
-\subsection{Straight Driving}
-
-For a straight drive over distance $d$, both wheels travel the same distance in the same direction:
+For a pivot, measure the average angular speed $\omega_{\mathrm{cal}}(q)$ and estimate
 \[
-s_L=s_R=d.
+T_{\mathrm{pivot}}=\frac{|\theta|}{\omega_{\mathrm{cal}}(q)}.
 \]
-If one wheel travels farther than the other, the robot curves instead of following a straight line. In a real system, small differences can come from wheel-diameter mismatch, friction, motor response, or encoder error.
+Under the ideal equal-wheel-speed model, the same pivot estimate can be written $T_{\mathrm{pivot}}=b|\theta|/(2v_{\mathrm{wheel}})$, where $v_{\mathrm{wheel}}$ is the measured speed of either wheel. In practice, calibration on the assembled robot is needed; the theoretical equations alone do not account for battery condition, uneven floor, payload, friction, or motor variation.
 
-\subsection{Converting Wheel Distance into Encoder Ticks}
-
-An encoder measures wheel rotation, not distance directly. The program converts the desired wheel travel into wheel revolutions and then into encoder ticks. Let $D$ be the wheel diameter and $N$ be the encoder ticks per wheel revolution. One full wheel revolution travels the circumference
+For example, if a test at the chosen PWM setting measures a straight speed of $0.20\,\mathrm{m/s}$, a $0.5\,\mathrm{ft}$ command ($0.1524\,\mathrm{m}$) gives
 \[
-C=\pi D.
+T_{\mathrm{drive}}=\frac{0.1524}{0.20}=0.762\,\mathrm{s}.
 \]
-The encoder target magnitude for a wheel travel distance $s$ is
+This is only an example calculation. The speed value must be measured on the actual robot. If the battery weakens or the floor/load changes, the same 0.762-second command may travel a different distance.
+
+\subsection{What the Motor-Voltage Model Means}
+
+A brushed DC motor's applied voltage is shared between electrical resistance, changing current, and the voltage generated as the motor spins:
 \[
-n_{\mathrm{ticks}}=\frac{|s|}{\pi D}N.
+V_{\mathrm{motor}}=Ri+L\frac{di}{dt}+K_e\omega,\qquad \tau=K_ti.
 \]
-The magnitude gives the number of ticks, while the sign tells the motor which direction to turn. For a pivot, the wheel arc distance is used:
-\[
-n_{\mathrm{pivot}}=\frac{(t/2)|\theta|}{\pi D}N.
-\]
-The left and right targets have opposite signs. For a straight drive, use
-\[
-n_{\mathrm{drive}}=\frac{d}{\pi D}N
-\]
-for both wheels with the same sign.
+Here $i$ is motor current, $\omega$ is shaft speed, and $\tau$ is motor torque. In plain terms, motor voltage influences speed, but the load and current determine how the motor responds. Voltage is not a distance measurement. DCLAR's open-loop plan uses a timed run based on a measured speed; it does not infer travel distance from the battery voltage.
 
-\subsection{Example Calculation}
+A nominal $9\,\mathrm{V}$ battery is only suitable if its output can support the motor's operating and startup/stall current, and if its voltage and current are within the motor-driver ratings. The battery connects to the driver's motor-supply input, not an ESP32 pin. No particular battery, motor-driver board, PWM duty, or timing calibration has been selected or validated in this repository.
 
-For illustration only, suppose the wheel track is $0.14\,\mathrm{m}$, the wheel diameter is $0.065\,\mathrm{m}$, the encoder scale is $360$ ticks per wheel revolution, and the robot needs to pivot $90^\circ$ clockwise. First convert the angle:
-\[
-\theta=90^\circ\frac{\pi}{180^\circ}=\frac{\pi}{2}\,\mathrm{rad}.
-\]
-The wheel arc distance is
-\[
-s=\frac{0.14}{2}\frac{\pi}{2}=0.10996\,\mathrm{m}.
-\]
-The wheel circumference is
-\[
-C=\pi(0.065)=0.20420\,\mathrm{m}.
-\]
-The tick magnitude is
-\[
-n_{\mathrm{ticks}}=\frac{0.10996}{0.20420}(360)\approx194\,\mathrm{ticks}.
-\]
-The ideal command is therefore approximately $+194$ ticks for the left wheel and $-194$ ticks for the right wheel under the positive-clockwise convention. These values are only an example; they are not DCLAR hardware calibration values.
+\subsection{Open-Loop Limits and Current Software Status}
 
-\subsection{From Encoder Targets to Motor Voltage and PWM}
+The intended robot design has no wheel-motion sensors. After a timed command, the controller can know only that it issued the command for the scheduled duration; it cannot confirm the robot's actual position, detect a stalled wheel, or correct a turn that came up short. Wheel slip, startup delay, battery sag, friction, and small motor differences cause accumulated position error. The map's robot position is therefore a commanded estimate, not a measured pose. The GUI's simulated proximity and leak behavior are not physical sensing.
 
-The designed control pipeline starts with a geometric target, such as ``drive forward $d$ feet'' or ``pivot by $\Delta\theta$.'' The planner converts that target into left- and right-wheel distances, then into signed encoder tick targets using the measured wheel diameter, wheel track, and encoder resolution described above. The tick targets specify how far each wheel should rotate; they do not specify a motor voltage or PWM duty cycle.
-
-The intended electrical arrangement uses a battery as the motor-power source and a motor bridge (H-bridge) to switch that power to each motor. In a typical arrangement, the battery positive and return connect to the bridge's motor-supply and power-ground terminals, the motors connect to the bridge outputs, and ESP32 GPIO signals connect only to the bridge's logic inputs. The ESP32 and bridge need a shared logic reference/ground, and the bridge must be compatible with the controller's logic voltage. The exact wiring depends on the selected bridge module and its datasheet. The battery is not connected to an ESP32 GPIO, and the motors are not powered from an ESP32 pin.
-
-PWM (pulse-width modulation) is a control waveform sent to a bridge input such as an enable/PWM pin. It is not the battery supply and does not itself provide motor power. The bridge rapidly switches the battery-powered motor output; changing the PWM duty ratio $q$ changes the approximate average voltage applied to the motor. For example, the TI DRV8876N documentation shows the controller's PWM/direction inputs separately from the motor supply $V_M$; this is an example of the interface, not a selected DCLAR component (\href{https://www.ti.com/lit/ds/symlink/drv8876n.pdf}{TI DRV8876N datasheet}). In a simplified model,
-\[
-V_{\mathrm{motor,avg}}\approx q V_{\mathrm{battery}},\qquad 0\le q\le1,
-\]
-with direction selected by the bridge's direction/polarity inputs. This approximation ignores voltage drops in the bridge, battery sag, motor inductance, and switching behavior. A PWM signal therefore controls the motor's applied power level through the driver; it is not a direct distance command. ESP32 PWM peripherals can generate such control waveforms (see the \href{https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/ledc.html}{Espressif LEDC documentation}), but the correct pins, frequency, duty range, and bridge input mode depend on the hardware selected.
-
-Motor voltage alone cannot reliably determine travel distance. A simplified DC motor model is
-\[
-V_{\mathrm{motor}}=R i + L\frac{di}{dt}+K_e\omega,
-\qquad \tau=K_t i,
-\]
-where current $i$ produces torque $\tau$, while angular speed $\omega$ creates back-EMF. The speed and resulting distance also depend on load, wheel traction, battery voltage under load, friction, and motor variation. The same nominal voltage can produce different motion, and a motor can stall while voltage is present. DCLAR therefore derives the requested distance from map geometry and uses encoder feedback to measure wheel rotation; it does not infer distance from the battery voltage.
-
-The intended closed-loop driver compares each wheel's measured encoder count with its target. The count error is used to adjust PWM duty (and thus motor speed/torque) while the bridge selects direction. The driver reduces or stops drive as the target is reached, stops both motors on timeout or fault, and reports completion only after both wheel targets complete. Distance can then be estimated from measured encoder counts:
-\[
-d_{\mathrm{measured}}=\frac{|n_{\mathrm{measured}}|}{N}\pi D,
-\]
-where $N$ is encoder ticks per wheel revolution and $D$ is the calibrated loaded wheel diameter. This estimate is wheel odometry and can drift if the wheels slip.
-
-For a straight-drive example using the illustrative $D=65\,\mathrm{mm}$ and $N=360$ values above, a $0.5\,\mathrm{ft}$ target becomes $152.4\,\mathrm{mm}$ and approximately
-\[
-n_{\mathrm{target}}=\frac{152.4}{\pi(65)}(360)\approx269\,\mathrm{ticks}
-\]
-for each wheel. The motor driver would then use encoder feedback and PWM to reach those two tick targets. The $9\,\mathrm{V}$ supply does not appear in this distance-to-ticks calculation; it supplies energy to the bridge and affects available motor speed and torque.
-
-For DCLAR, a nominal $9\,\mathrm{V}$ battery would be a candidate motor supply only if the motor's rated voltage and stall current, the battery's ability to supply that current, and the bridge's operating-voltage/current/thermal ratings are all compatible. The battery connects to the bridge motor-supply input, not as an ``input voltage'' that the ESP32 converts into a travel distance. Do not assume a battery labeled $9\,\mathrm{V}$ can provide the required motor current; verify its datasheet and the motor's stall current before selecting it. No battery, motor, bridge, PWM setting, or current limit is selected or validated in the current repository.
-
-This describes the student's intended physics/control pipeline: map distance and heading become wheel travel, wheel travel becomes encoder targets, encoder feedback closes the motion loop, and PWM-controlled bridge outputs apply battery power to the motors. The design contribution is the target-distance-to-wheel-motion concept and the intended encoder-feedback/PWM bridge pipeline; component selection and hardware calibration remain open engineering work. The current firmware implements the geometry-to-tick conversion only. It does not yet generate PWM, measure encoders, or drive an H-bridge.
-
-\subsection{Why the Dimensions Must Be Calibrated}
-
-The equations assume that the wheel diameter, wheel track, and encoder scale are known. If the wheel diameter is entered too large, the program predicts fewer wheel revolutions than the real robot needs for a given distance. If the wheel track is wrong, the calculated pivot angle will also be wrong.
-
-Even with careful measurements, the ideal model will not perfectly match the real floor. Possible sources of error include:
-\begin{itemize}
-    \item wheel slip during acceleration or turning;
-    \item different effective wheel diameters;
-    \item backlash in the drivetrain;
-    \item uneven floor surfaces and changing friction;
-    \item encoder quantization or missed counts;
-    \item the robot not rotating exactly about its geometric center.
-\end{itemize}
-
-This is why the motor driver should use closed-loop encoder feedback. It should stop when the target is reached and also stop if a timeout or fault occurs. Encoder odometry estimates motion from wheel rotation; it is not the same as external localization. A camera, lidar, or another localization method would be needed to correct accumulated position error.
-
-The wheel track is the distance between wheel centerlines. It is not the $7\,\mathrm{in}\times5\,\mathrm{in}$ robot body footprint. These are different measurements and should not be substituted for one another.
+The current repository still contains an earlier geometry-to-wheel-target placeholder in \texttt{esp32/robot\_motion.py}, and \texttt{esp32/esp32\_robot\_control.py} expects a separate motor backend. Those files do not implement the intended timed PWM motor control. The planned hardware implementation must replace that placeholder with duration-based commands, set direction and PWM through the selected bridge, and stop after the calculated time. Any completion message would mean the timed command elapsed, not that the robot physically reached its target.
 
 \section{Hardware Communication and Execution}
 
@@ -379,7 +300,7 @@ Messages are plain-text lines with fields separated by the pipe character \textt
 SEG|mission_id|sequence|pivot_degrees|distance_ft|target_x_ft|target_y_ft|heading_degrees
 \end{lstlisting}
 
-The bridge forwards the segment. The robot can reply with \texttt{RECEIVED}, followed by a \texttt{PLAN} message containing calculated wheel targets, and then \texttt{DONE} after the configured motor backend reports completion. An \texttt{ERR} message indicates a failure. The desktop waits for the matching mission and sequence completion before sending the next segment.
+The bridge forwards the segment. In the intended implementation, the robot will reply with \texttt{RECEIVED}, report the direction/PWM/duration command in \texttt{PLAN}, then send \texttt{DONE} when the scheduled duration elapses. The current receiver does not yet implement timed execution and can return \texttt{ERR} because its old motion configuration and motor backend are not supplied. A future \texttt{DONE} would confirm only that the timer elapsed, not that the robot reached its target.
 
 A \texttt{TX} message from the bridge only indicates that the radio send succeeded at the communication layer. It does not mean the robot completed the movement. The desktop advances the mission only after it receives the matching robot-side \texttt{DONE} response. The bridge relays messages but does not own the mission state.
 
@@ -389,14 +310,13 @@ The USB connection can be checked separately using \texttt{PING} and \texttt{PON
 
 Physical movement is intentionally disabled until the robot has:
 \begin{itemize}
-    \item measured wheel diameter and wheel-center track width;
-    \item measured encoder ticks per wheel revolution;
-    \item configured a maximum wheel speed;
-    \item supplied an encoder-aware \texttt{motor\_driver.py} with \texttt{move\_wheels(...)} and \texttt{stop()} functions;
-    \item verified timeout and fault handling, including stopping the motors if a command does not complete.
+    \item measured straight-line speed and pivot rate at the selected PWM setting and battery condition;
+    \item selected a maximum PWM duty and a maximum motor run time;
+    \item supplied a timed \texttt{motor\_driver.py} that sets direction/PWM, runs for the requested duration, and stops both motors;
+    \item checked that the battery and driver support the motors' voltage and current draw, including startup/stall current, and verified a reliable stop command.
 \end{itemize}
 
-No motor pinout or motor-driver model is assumed. Without this hardware-specific implementation, the receiver should return a configuration error rather than attempting motion. The reported pose is commanded odometry, not an independent localization measurement. The current system also has no physical obstacle-safety model.
+No motor pinout or motor-driver model is assumed. Without this hardware-specific implementation, the receiver should return a configuration error rather than attempting motion. Completion after a timed command is not proof that the robot reached its target; the reported pose remains an open-loop estimate. The current system also has no physical obstacle-safety model.
 
 \section{Spill Annotation and Simulated Stop}
 
@@ -488,7 +408,7 @@ Testing should proceed from software-only checks toward hardware checks:
     \item Connect the main-control ESP32 and confirm that the matching PONG token is returned by \textbf{Connect + identify}.
     \item Use the manual \textbf{Ping ESP32} control and confirm that the same GUI token is returned.
     \item With both ESP32 boards configured to the same channel, confirm that a robot message is received and relayed as an \texttt{RX} line.
-    \item Test the robot receiver with the motor backend disabled or safely disconnected. Confirm that it parses segments and reports the expected encoder targets.
+    \item Check radio command parsing without connecting the motors; the current firmware is not the timed motor implementation and may return a setup error for motion commands.
     \item Only after calibration, motor-driver implementation, and safe bench testing should physical movement be enabled.
 \end{enumerate}
 
@@ -503,7 +423,7 @@ The next engineering steps are:
     \item Calibrate the floor map and add footprint-aware clearance checks around racks.
     \item Measure the sensor field of view and define a real coverage requirement, including overlap and localization error.
     \item Add a localization source for $(x,y,\theta)$ in the global map frame.
-    \item Implement and test the encoder-aware motor driver with speed, timeout, and emergency-stop behavior.
+    \item Implement and calibrate the open-loop timed PWM motor driver, including a maximum run-time and emergency-stop behavior.
     \item Validate pivot and straight-drive performance on the actual floor, including slip and turning error.
     \item Add physical leak-sensor logic and a method for handling false alarms.
     \item Log timestamps, measured pose, sensor readings, commands, and completion status for each segment.
