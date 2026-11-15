@@ -68,8 +68,8 @@ Within-tile coverage & Student-led footprint and coverage intent; AI-assisted wa
 Desktop GUI and mission coordination & Student-directed workflow and requested features; AI-assisted implementation and debugging & Implemented in \texttt{main.py}; visualization and simulation are software behavior.\\
 USB serial protocol & Student selected PySerial and line-oriented packet approach; AI-assisted formatting, connection, and debugging & Implemented in \texttt{serial\_link.py} and \texttt{serial\_protocol.py}; operation depends on the correct board, port, and firmware.\\
 ESP32 radio bridge and display & Student-directed ESP-NOW link and status-display requirements; AI-assisted firmware and integration & Firmware is present; board/channel/MAC setup and hardware checks are required.\\
-Robot segment and motion timing & Student-directed motion interface and open-loop motor-control concept & Geometric segment parsing is present; timed PWM execution is planned but not implemented.\\
-Motor control, localization, leak sensing & Student-led open-loop PWM and timed-motion concept; AI-assisted documentation and interface refinement & Timed PWM control is the intended approach; driver wiring, timing calibration, localization, and leak sensing remain future work.\\
+Robot segment and motion timing & Student-directed motion interface and open-loop motor-control concept & Geometric segment parsing is present; timed planner-path execution is planned but not implemented.\\
+Motor control, localization, leak sensing & Student-led open-loop PWM and timed-motion concept; AI-assisted implementation and documentation & Bounded manual motor jog packets are implemented; calibrated timed path execution, localization, and leak sensing remain future work.\\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -120,7 +120,7 @@ $\downarrow$ \small{ESP-NOW wireless messages over a shared Wi-Fi channel}
 \vspace{5pt}
 \end{minipage}
 }
-\caption{DCLAR software and hardware communication architecture. The robot-side motor driver must be calibrated and configured before physical motion is enabled.}
+\caption{DCLAR software and hardware communication architecture. Manual motor jogs are bounded and open loop; calibrated planner-path execution is not implemented.}
 \end{figure}
 
 \section{Subsystem Breakdown}
@@ -135,9 +135,9 @@ Map routing & \texttt{route.py} & Represents rack cells as obstacles and uses BF
 Tile coverage & \texttt{search.py} & Generates ordered zigzag or circle-spiral waypoints for one tile.\\
 USB communication & \texttt{serial\_link.py}, \texttt{serial\_protocol.py} & Finds serial ports, opens the desktop-to-ESP32 connection, and formats messages.\\
 Radio bridge & \texttt{esp32/esp32\_main\_control.py} & Receives USB serial lines, forwards commands over ESP-NOW, and relays robot replies.\\
-Robot receiver & \texttt{esp32/esp32\_robot\_control.py} & Receives path segments; current motor execution is not implemented.\\
-Motion conversion & \texttt{esp32/robot\_motion.py} & Contains an earlier wheel-target placeholder; planned control converts distance/turn into motor run times.\\
-Motor backend & \texttt{motor\_driver.py} interface & Planned to set direction/PWM and stop after calibrated run times; hardware-specific implementation is not yet supplied.\\
+Robot receiver & \texttt{esp32/esp32\_robot\_control.py} & Receives radio messages and executes bounded motor-jog packets; planner path execution remains a placeholder.\\
+Motion conversion & \texttt{esp32/robot\_motion.py} & Contains an earlier wheel-target placeholder; calibrated timed path conversion is future work.\\
+Motor output & \texttt{esp32/motor\_driver.py} & Sets direction and capped PWM for manual jogs using the listed L298N-style GPIO mapping.\\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -289,7 +289,7 @@ A nominal $9\,\mathrm{V}$ battery is only suitable if its output can support the
 
 The intended robot design has no wheel-motion sensors. After a timed command, the controller can know only that it issued the command for the scheduled duration; it cannot confirm the robot's actual position, detect a stalled wheel, or correct a turn that came up short. Wheel slip, startup delay, battery sag, friction, and small motor differences cause accumulated position error. The map's robot position is therefore a commanded estimate, not a measured pose. The GUI's simulated proximity and leak behavior are not physical sensing.
 
-The current repository still contains an earlier geometry-to-wheel-target placeholder in \texttt{esp32/robot\_motion.py}, and \texttt{esp32/esp32\_robot\_control.py} expects a separate motor backend. Those files do not implement the intended timed PWM motor control. The planned hardware implementation must replace that placeholder with duration-based commands, set direction and PWM through the selected bridge, and stop after the calculated time. Any completion message would mean the timed command elapsed, not that the robot physically reached its target.
+The current repository still contains an earlier geometry-to-wheel-target placeholder in \texttt{esp32/robot\_motion.py}. It does not implement timed execution of planner paths. A separate bounded \texttt{MOTOR\_TEST} command does set direction and PWM through \texttt{esp32/motor\_driver.py} for a short duration. Any completion message means only that the jog timer elapsed, not that the robot physically reached a target or that the motors were observed to move.
 
 \section{Hardware Communication and Execution}
 
@@ -300,23 +300,32 @@ Messages are plain-text lines with fields separated by the pipe character \textt
 SEG|mission_id|sequence|pivot_degrees|distance_ft|target_x_ft|target_y_ft|heading_degrees
 \end{lstlisting}
 
-The bridge forwards the segment. In the intended implementation, the robot will reply with \texttt{RECEIVED}, report the direction/PWM/duration command in \texttt{PLAN}, then send \texttt{DONE} when the scheduled duration elapses. The current receiver does not yet implement timed execution and can return \texttt{ERR} because its old motion configuration and motor backend are not supplied. A future \texttt{DONE} would confirm only that the timer elapsed, not that the robot reached its target.
+The bridge forwards the segment. The existing planner-path receiver still uses the earlier wheel-target placeholder and does not execute calibrated timed path motion. It may return \texttt{ERR} because its legacy geometry and motor backend are not supplied. The manual motor-test path is separate:
+\begin{lstlisting}
+MOTOR_TEST|test_id|direction_a|direction_b|duty_u16|duration_ms
+MOTOR_STOP|test_id
+\end{lstlisting}
+Direction values are $-1$ (reverse), $0$ (off), and $1$ (forward). The robot accepts a duty value from 1 through 49151 (75 percent of the 16-bit PWM range) and a duration from 100 through 1500 ms. It replies with \texttt{MOTOR\_TEST\_STARTED}, then \texttt{MOTOR\_TEST\_DONE} when the timer expires, or \texttt{MOTOR\_TEST\_STOPPED} after a matching stop packet. Invalid or overlapping tests receive \texttt{MOTOR\_TEST\_ERR}. These replies confirm command handling/timer completion; they cannot verify physical motion because there is no wheel feedback.
+
+The reply forms are \texttt{MOTOR\_TEST\_STARTED|test\_id|duration\_ms}, \texttt{MOTOR\_TEST\_DONE|test\_id|elapsed\_ms}, \texttt{MOTOR\_TEST\_STOPPED|test\_id|elapsed\_ms}, and \texttt{MOTOR\_TEST\_ERR|test\_id|reason}. The robot radio ping uses \texttt{RADIO\_PING|token} and returns \texttt{RADIO\_PONG|token}.
+
+For example, \texttt{MOTOR\_TEST|J0001|1|1|19660|400} asks for a 400 ms forward jog on both channels at approximately 30 percent duty. A normal response sequence is \texttt{MOTOR\_TEST\_STARTED|J0001|400}, followed by \texttt{MOTOR\_TEST\_DONE|J0001|elapsed\_ms}. The \texttt{STOP motors} button sends \texttt{MOTOR\_STOP|J0001}; the driver disables PWM outputs, so the chassis may coast rather than brake instantly.
 
 A \texttt{TX} message from the bridge only indicates that the radio send succeeded at the communication layer. It does not mean the robot completed the movement. The desktop advances the mission only after it receives the matching robot-side \texttt{DONE} response. The bridge relays messages but does not own the mission state.
 
-The USB connection can be checked separately using \texttt{PING} and \texttt{PONG}. The GUI uses request tokens such as \texttt{GUI0022} or \texttt{APP0001}; the ESP32 returns the same token. This checks the computer-to-bridge serial connection and does not require the robot to move.
+The USB connection can be checked separately using \texttt{PING} and \texttt{PONG}. The GUI uses request tokens such as \texttt{GUI0022} or \texttt{APP0001}; the ESP32 returns the same token. This checks the computer-to-bridge serial connection and does not require the robot to move. The motor-test panel's \textbf{Ping robot radio} sends \texttt{RADIO\_PING|token}; a matching \texttt{RADIO\_PONG|token} confirms a round trip through the configured robot ESP32.
 
 \subsection{Hardware Requirements Before Motion}
 
-Physical movement is intentionally disabled until the robot has:
+The manual panel permits only bounded motor jogs. Calibrated planner-path movement remains unimplemented and requires:
 \begin{itemize}
     \item measured straight-line speed and pivot rate at the selected PWM setting and battery condition;
-    \item selected a maximum PWM duty and a maximum motor run time;
-    \item supplied a timed \texttt{motor\_driver.py} that sets direction/PWM, runs for the requested duration, and stops both motors;
-    \item checked that the battery and driver support the motors' voltage and current draw, including startup/stall current, and verified a reliable stop command.
+    \item a selected maximum PWM duty and maximum motor run time;
+    \item implementation of a path-segment handler that converts planned distances and turns into bounded motor run times;
+    \item verification of battery and driver voltage/current ratings against motor startup/stall current, and of a reliable stop command.
 \end{itemize}
 
-No motor pinout or motor-driver model is assumed. Without this hardware-specific implementation, the receiver should return a configuration error rather than attempting motion. Completion after a timed command is not proof that the robot reached its target; the reported pose remains an open-loop estimate. The current system also has no physical obstacle-safety model.
+The motor jog driver pinout is documented above, but its exact board wiring must be verified before use. A planner path must not be treated as executable until its timed segment handler is implemented. Completion after a timed command is not proof that the robot reached its target; the reported pose remains an open-loop estimate. The current system also has no physical obstacle-safety model.
 
 \section{Spill Annotation and Simulated Stop}
 
@@ -381,7 +390,19 @@ The display configuration in the firmware uses the Feather ESP32-S3 TFT pin assi
 
 \subsection{Robot ESP32 Setup}
 
-Copy \texttt{esp32/esp32\_robot\_control.py} and \texttt{esp32/robot\_motion.py} to the robot ESP32 root using Thonny. Both ESP32 boards must use the same \texttt{WIFI\_CHANNEL}. The main-control board must contain the robot's MAC address. The robot receiver learns the main-control board's MAC from its first radio packet.
+Copy \texttt{esp32/esp32\_robot\_control.py}, \texttt{esp32/robot\_motion.py}, \texttt{esp32/motor\_driver.py}, and \texttt{motor\_test\_protocol.py} to the robot ESP32 root using Thonny. Both ESP32 boards must use the same \texttt{WIFI\_CHANNEL}. The main-control board must contain the robot's MAC address. The robot receiver learns the main-control board's MAC from its first radio packet.
+
+\subsection{L298N Motor Bridge Wiring and Limits}
+
+The current motor-test driver uses direction GPIOs IN1--IN4 on ESP32 pins 26, 25, 33, and 32, and PWM GPIOs ENA/ENB on pins 14 and 27 at 1 kHz. These assignments target a classic ESP32-style board and must be checked against the exact ESP32 module. For classic ESP32-WROOM modules, GPIO6--GPIO11 are connected to SPI flash and must not be used as ordinary motor-control pins (see the \href{https://www.espressif.com/sites/default/files/documentation/esp32-wroom-32_datasheet_en.pdf}{Espressif ESP32-WROOM-32 datasheet}). GPIO assignments vary across ESP32 families and development boards. MicroPython's ESP32 PWM API represents \texttt{duty\_u16} on a 0--65535 scale (\href{https://docs.micropython.org/en/v1.28.0/esp32/quickref.html}{MicroPython ESP32 quick reference}).
+
+On a common L298N module, remove the ENA and ENB jumpers before connecting ESP32 PWM pins to those inputs; otherwise a jumper can hold an enable input high and may conflict with a GPIO output. Connect the motor battery to the module's labeled motor-supply input and ground, the two motors to the output terminals, and ESP32 ground to driver ground. Power the ESP32 separately over USB for initial tests. Never connect ESP32 3V3 to the L298N 5V rail. Some L298N modules include a 5 V regulator and a regulator-enable jumper, while others differ; do not assume the module's 5 V terminal is an output or connect it to ESP32 VIN/5V without verifying the exact board's schematic and instructions.
+
+The pasted 9 V / 75 percent calculation is not a guarantee that a 3--6 V TT motor receives a safe voltage. The L298 has a load-dependent output voltage drop (see the \href{https://www.st.com/resource/en/datasheet/l298.pdf}{ST L298 datasheet}); actual module losses, battery sag, and motor current vary. PWM rapidly switches the motor supply, so the duty-cycle average is only an approximation of motor behavior and does not cap every instantaneous pulse at a lower voltage. The firmware limits jog duty to 49151/65535 (75 percent) as a software ceiling, not as proof of motor protection. Prefer a supply and driver suitable for the motor rating; verify the motor's startup/stall current and the exact module's voltage/current/thermal limits. A rectangular smoke-detector 9 V battery is not the assumed motor source; select a pack or supply that can provide the motors' current without unacceptable sag.
+
+For first use, raise the drive wheels clear of the floor, check all wiring and common ground, use the default 30 percent duty and 400 ms pulse, and test one motor at a time before testing forward, reverse, and pivots. The GUI's STOP packet is a wireless convenience; it is not an emergency disconnect. The jog also stops automatically at its duration limit, but remove battery power physically if a motor does not stop.
+
+The forward/pivot button labels assume both channels' direction wiring matches the code's positive-direction convention. If an individual motor turns opposite to the desired robot direction, set its \texttt{MOTOR\_A\_DIRECTION\_INVERTED} or \texttt{MOTOR\_B\_DIRECTION\_INVERTED} option in \texttt{motor\_driver.py} after testing each channel separately.
 
 \subsection{Communication Checks and Direct Test Message}
 
@@ -398,6 +419,8 @@ MOVE|2|1.25|3.50|90.0|DRIVE
 \end{lstlisting}
 The fields are task ID, target $x$ and $y$ in feet, heading in degrees (or \texttt{AUTO}), and instruction (\texttt{DRIVE} or \texttt{TURN}). \texttt{DRIVE} heads toward the target; a numeric heading must agree within the configured three-degree tolerance. \texttt{TURN} pivots in place to the requested heading. A direct \texttt{TASK} command is rejected with \texttt{PATH\_SEGMENTS\_REQUIRED}; planner output should be sent using the planned-path interface.
 
+The same window has a bounded robot motor-jog panel. Select PWM duty (1--75 percent) and pulse duration (100--1500 ms), then send forward, reverse, pivot-left, pivot-right, Motor A-only, or Motor B-only packets. Replies appear in the serial log. A completed packet is evidence that the ESP32 accepted and timed the command; visually confirm wheel movement. These tests do not measure speed, distance, or motor health.
+
 \subsection{Testing Order}
 
 Testing should proceed from software-only checks toward hardware checks:
@@ -408,8 +431,9 @@ Testing should proceed from software-only checks toward hardware checks:
     \item Connect the main-control ESP32 and confirm that the matching PONG token is returned by \textbf{Connect + identify}.
     \item Use the manual \textbf{Ping ESP32} control and confirm that the same GUI token is returned.
     \item With both ESP32 boards configured to the same channel, confirm that a robot message is received and relayed as an \texttt{RX} line.
+    \item With drive wheels raised and motor wiring checked, send a short Motor A-only and Motor B-only jog. Confirm each wheel visibly turns and the matching motor-test acknowledgement appears. Then try forward and pivot directions; use STOP if needed.
     \item Check radio command parsing without connecting the motors; the current firmware is not the timed motor implementation and may return a setup error for motion commands.
-    \item Only after calibration, motor-driver implementation, and safe bench testing should physical movement be enabled.
+    \item Only conduct floor runs or planner-path operation after calibration and safe bench testing; the manual jog remains a short, open-loop check.
 \end{enumerate}
 
 A successful USB PING/PONG, radio \texttt{TX}, or calculated \texttt{PLAN} is not proof of physical movement. Each checks a different layer of the system.

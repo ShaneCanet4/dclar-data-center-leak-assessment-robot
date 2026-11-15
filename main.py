@@ -47,6 +47,12 @@ from serial_protocol import (
     make_segment_message,
     make_task_message,
 )
+from motor_test_protocol import (
+    MAX_MOTOR_TEST_DURATION_MS,
+    make_motor_stop_message,
+    make_motor_test_message,
+    make_robot_radio_ping_message,
+)
 
 from route import nearest_unsearched, path_between, uniform_rack_obstacles
 from search import (
@@ -117,6 +123,12 @@ next_task_id = 1
 next_ping_id = 1
 serial_port_map = {}
 pending_ping_tokens = set()
+pending_motor_test_tokens = set()
+pending_robot_ping_tokens = set()
+next_motor_test_id = 1
+next_robot_ping_id = 1
+active_motor_test_token = None
+motor_test_status_text = None
 last_serial_port_signature = None
 hardware_mission_counter = 1
 hardware_mission_id = None
@@ -1432,11 +1444,50 @@ def finish_hardware_mission():
 def handle_robot_radio_event(line):
     """Process a robot reply relayed by the main-control ESP32."""
     global hardware_path_index, robot_row, robot_column, robot_heading
+    global active_motor_test_token
     fields = line.split("|", 2)
     if len(fields) < 3 or fields[0] != "RX":
         return
     robot_fields = fields[2].split("|")
     kind = robot_fields[0]
+
+    if kind == "RADIO_PONG" and len(robot_fields) >= 2:
+        token = robot_fields[1]
+        if token in pending_robot_ping_tokens:
+            pending_robot_ping_tokens.discard(token)
+            message = "Robot ESP32 radio ping passed (%s)." % token
+            if motor_test_status_text is not None:
+                motor_test_status_text.set(message)
+            append_serial_log(message)
+        else:
+            append_serial_log("Ignored unmatched robot radio ping: " + token)
+        return
+    if kind.startswith("MOTOR_TEST_") and len(robot_fields) >= 2:
+        token = robot_fields[1]
+        if token not in pending_motor_test_tokens:
+            append_serial_log("Ignored unmatched motor-test reply: " + fields[2])
+            return
+        if kind == "MOTOR_TEST_STARTED":
+            duration = robot_fields[2] if len(robot_fields) >= 3 else "?"
+            message = "Jog running (%s ms). Watch the robot." % duration
+            if motor_test_status_text is not None:
+                motor_test_status_text.set(message)
+            append_serial_log("Robot acknowledged motor jog %s" % token)
+            return
+        pending_motor_test_tokens.discard(token)
+        if active_motor_test_token == token:
+            active_motor_test_token = None
+        detail = robot_fields[2] if len(robot_fields) >= 3 else ""
+        if kind == "MOTOR_TEST_DONE":
+            message = "Timed jog ended; visually inspect motion (no wheel feedback)."
+        elif kind == "MOTOR_TEST_STOPPED":
+            message = "Robot acknowledged motor stop."
+        else:
+            message = "Motor-test error: %s" % detail
+        if motor_test_status_text is not None:
+            motor_test_status_text.set(message)
+        append_serial_log("Robot %s for %s %s" % (kind, token, detail))
+        return
 
     if kind == "RECEIVED" and len(robot_fields) >= 3:
         mission, sequence = robot_fields[1], robot_fields[2]
@@ -1465,8 +1516,8 @@ def handle_robot_radio_event(line):
         append_serial_log("Ignored stale/unmatched robot DONE: " + fields[2])
         return
 
-    # DONE is emitted only after the robot's configured motor backend reports
-    # encoder completion. The GUI pose is the commanded odometry estimate.
+    # DONE indicates that the firmware reported completion. Without wheel
+    # feedback, the GUI pose remains only the commanded motion estimate.
     command = hardware_path_commands[hardware_path_index]
     robot_column = command["target_x_ft"]
     robot_row = command["target_y_ft"]
@@ -1487,6 +1538,9 @@ def start_hardware_path():
     global hardware_path_commands, hardware_path_index, hardware_waiting_sequence
     if esp32_link is None:
         serial_status_text.set("Connect to the main-control ESP32 first")
+        return
+    if active_motor_test_token is not None:
+        serial_status_text.set("Wait for or stop the active motor jog before a planned path")
         return
     if leak_stop_latched:
         serial_status_text.set("Acknowledge the leak stop before sending a path")
@@ -1547,6 +1601,8 @@ def poll_serial_events():
 def open_robot_control():
     """Open task, coordinate, and USB communication controls in a child window."""
     global control_window, control_log, next_task_id, next_ping_id
+    global next_motor_test_id, next_robot_ping_id
+    global active_motor_test_token, motor_test_status_text
     if control_window is not None and control_window.winfo_exists():
         control_window.deiconify()
         control_window.lift()
@@ -1554,7 +1610,7 @@ def open_robot_control():
 
     control_window = tk.Toplevel(window)
     control_window.title("ESP32 Robot Control")
-    control_window.geometry("560x570")
+    control_window.geometry("680x840")
     control_window.protocol("WM_DELETE_WINDOW", close_robot_control)
     ttk.Label(
         control_window,
@@ -1650,8 +1706,160 @@ def open_robot_control():
         row=3, column=3, padx=(6, 0), sticky="e"
     )
 
+    motor_frame = ttk.LabelFrame(control_window, text="Robot ESP32 motor jog test", padding=10)
+    motor_frame.grid(row=4, column=0, padx=10, pady=4, sticky="ew")
+    ttk.Label(
+        motor_frame,
+        text="Short open-loop packets go to the robot MAC configured in the main-control ESP32.",
+        wraplength=630,
+    ).grid(row=0, column=0, columnspan=5, sticky="w")
+    ttk.Label(motor_frame, text="PWM duty (%)").grid(row=1, column=0, pady=(8, 0), sticky="w")
+    motor_duty_var = tk.StringVar(value="30")
+    ttk.Entry(motor_frame, textvariable=motor_duty_var, width=8).grid(
+        row=2, column=0, padx=(0, 10), sticky="w"
+    )
+    ttk.Label(motor_frame, text="Run time (ms; max 1500)").grid(
+        row=1, column=1, pady=(8, 0), sticky="w"
+    )
+    motor_duration_var = tk.StringVar(value="400")
+    ttk.Entry(motor_frame, textvariable=motor_duration_var, width=10).grid(
+        row=2, column=1, padx=(0, 10), sticky="w"
+    )
+
+    def send_robot_radio_ping():
+        global next_robot_ping_id
+        if esp32_link is None:
+            motor_test_status_text.set("Connect to the main-control ESP32 first.")
+            return
+        token = "RP%04d" % next_robot_ping_id
+        message = make_robot_radio_ping_message(token)
+        if send_esp32_line(message):
+            next_robot_ping_id += 1
+            pending_robot_ping_tokens.add(token)
+            motor_test_status_text.set("Robot radio ping sent; waiting for the configured robot MAC.")
+
+            def radio_ping_timeout():
+                if token in pending_robot_ping_tokens:
+                    pending_robot_ping_tokens.discard(token)
+                    if motor_test_status_text is not None:
+                        motor_test_status_text.set(
+                            "No robot ping reply. Check robot power, channel, firmware, and configured MAC."
+                        )
+
+            window.after(1500, radio_ping_timeout)
+
+    ttk.Button(motor_frame, text="Ping robot radio", command=send_robot_radio_ping).grid(
+        row=2, column=4, padx=(8, 0), sticky="w"
+    )
+
+    def motor_test_reply_timeout(token):
+        global active_motor_test_token
+        if active_motor_test_token != token:
+            return
+        append_serial_log("No robot completion reply for motor test %s; sending STOP" % token)
+        send_esp32_line(make_motor_stop_message(token))
+        if motor_test_status_text is not None:
+            motor_test_status_text.set(
+                "No completion reply; STOP sent. Waiting for stop acknowledgement."
+            )
+
+        def motor_stop_ack_timeout():
+            global active_motor_test_token
+            if active_motor_test_token != token:
+                return
+            pending_motor_test_tokens.discard(token)
+            active_motor_test_token = None
+            if motor_test_status_text is not None:
+                motor_test_status_text.set(
+                    "No stop reply. Check the robot and remove motor power if needed."
+                )
+
+        window.after(1500, motor_stop_ack_timeout)
+
+    def send_motor_jog(direction_a, direction_b, description):
+        global next_motor_test_id, active_motor_test_token
+        if esp32_link is None:
+            if motor_test_status_text is not None:
+                motor_test_status_text.set("Connect to the main-control ESP32 first.")
+            return
+        if hardware_mission_id is not None:
+            motor_test_status_text.set("Stop or finish the planned path before a motor jog.")
+            return
+        if active_motor_test_token is not None:
+            motor_test_status_text.set("Wait for the active jog or press STOP.")
+            return
+        try:
+            duty_percent = int(motor_duty_var.get())
+            duration_ms = int(motor_duration_var.get())
+            if not 1 <= duty_percent <= 75:
+                raise ValueError("PWM duty must be from 1% through 75%")
+            duty_u16 = int(round(duty_percent * 65535 / 100.0))
+            token = "J%04d" % next_motor_test_id
+            message = make_motor_test_message(
+                token, direction_a, direction_b, duty_u16, duration_ms
+            )
+            if send_esp32_line(message):
+                next_motor_test_id += 1
+                active_motor_test_token = token
+                pending_motor_test_tokens.add(token)
+                motor_test_status_text.set("Sent %s; waiting for robot acknowledgement." % description)
+                window.after(
+                    MAX_MOTOR_TEST_DURATION_MS + 1500,
+                    motor_test_reply_timeout,
+                    token,
+                )
+        except Exception as error:
+            messagebox.showerror("Invalid motor test", str(error), parent=control_window)
+
+    jog_buttons = (
+        ("Forward", 1, 1),
+        ("Reverse", -1, -1),
+        ("Pivot left", -1, 1),
+        ("Pivot right", 1, -1),
+        ("Motor A only", 1, 0),
+        ("Motor B only", 0, 1),
+    )
+    for index, (label, direction_a, direction_b) in enumerate(jog_buttons):
+        ttk.Button(
+            motor_frame,
+            text=label,
+            command=lambda da=direction_a, db=direction_b, name=label:
+                send_motor_jog(da, db, name),
+        ).grid(row=3 + index // 4, column=index % 4, padx=(0, 6), pady=(8, 0), sticky="ew")
+    ttk.Button(
+        motor_frame,
+        text="STOP motors",
+        command=lambda: send_motor_stop(),
+    ).grid(row=4, column=2, columnspan=2, pady=(8, 0), sticky="ew")
+    motor_test_status_text = tk.StringVar(
+        value=(
+            "A jog is still active; wait for its reply or send STOP."
+            if active_motor_test_token is not None
+            else "Raise the drive wheels for first tests; packets control the configured robot MAC."
+        )
+    )
+    ttk.Label(
+        motor_frame,
+        textvariable=motor_test_status_text,
+        wraplength=630,
+    ).grid(row=5, column=0, columnspan=5, pady=(8, 0), sticky="w")
+    ttk.Label(
+        motor_frame,
+        text="The reply confirms a timed command only. Check wheel motion visually; wireless STOP is not an emergency disconnect.",
+        wraplength=630,
+    ).grid(row=6, column=0, columnspan=5, pady=(4, 0), sticky="w")
+    for column in range(5):
+        motor_frame.columnconfigure(column, weight=1)
+
+    def send_motor_stop():
+        token = active_motor_test_token or "STOP"
+        if send_esp32_line(make_motor_stop_message(token)):
+            pending_motor_test_tokens.add(token)
+            if motor_test_status_text is not None:
+                motor_test_status_text.set("STOP packet sent; waiting for robot reply.")
+
     test_frame = ttk.LabelFrame(control_window, text="USB communication test", padding=10)
-    test_frame.grid(row=4, column=0, padx=10, pady=4, sticky="ew")
+    test_frame.grid(row=5, column=0, padx=10, pady=4, sticky="ew")
     ttk.Label(
         test_frame,
         text="PING/PONG verifies the computer ↔ main-control ESP32 USB link.",
@@ -1684,8 +1892,8 @@ def open_robot_control():
     ).grid(row=3, column=0, pady=(8, 0), sticky="w")
 
     log_frame = ttk.LabelFrame(control_window, text="Serial activity", padding=8)
-    log_frame.grid(row=5, column=0, padx=10, pady=(4, 10), sticky="nsew")
-    control_window.rowconfigure(5, weight=1)
+    log_frame.grid(row=6, column=0, padx=10, pady=(4, 10), sticky="nsew")
+    control_window.rowconfigure(6, weight=1)
     control_window.columnconfigure(0, weight=1)
     control_log = tk.Text(log_frame, height=9, width=68, state="disabled", wrap="word")
     control_log.grid(row=0, column=0, sticky="nsew")
@@ -1697,11 +1905,14 @@ def open_robot_control():
 
 def close_robot_control():
     """Close the child window while keeping the main serial connection open."""
-    global control_window, control_log
+    global control_window, control_log, motor_test_status_text
+    if active_motor_test_token is not None and esp32_link is not None:
+        send_esp32_line(make_motor_stop_message(active_motor_test_token))
     if control_window is not None:
         control_window.destroy()
     control_window = None
     control_log = None
+    motor_test_status_text = None
 
 
 def close_main_window():
@@ -1714,6 +1925,8 @@ def close_main_window():
         # after_cancel(id) removes a callback that was queued with window.after().
         window.after_cancel(main_after_id)
     if esp32_link is not None:
+        if active_motor_test_token is not None:
+            send_esp32_line(make_motor_stop_message(active_motor_test_token))
         esp32_link.close()
     # destroy() closes this window and releases its Tk widgets.
     window.destroy()

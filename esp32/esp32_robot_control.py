@@ -1,18 +1,22 @@
-"""Robot-side ESP-NOW receiver and differential-drive command translator.
+"""Robot-side ESP-NOW receiver with bounded open-loop motor-jog packets.
 
-Copy this file and robot_motion.py onto the robot ESP32. Commands are sent by
-the main-control ESP32 as pipe-delimited ASCII. This file intentionally refuses
-to move until wheel geometry and a real encoder-aware motor_driver.py are set
-up for the robot's motor board.
+Copy this file, robot_motion.py, motor_driver.py, and motor_test_protocol.py to
+the robot ESP32. The MOTOR_TEST path uses direction pins and PWM for a short,
+validated duration. The older SEG/MOVE path remains a separate placeholder and
+does not provide calibrated timed travel.
 """
 
 import network
 import espnow
 import math
 import sys
-from time import sleep_ms
+from time import sleep_ms, ticks_ms, ticks_diff
 
 from robot_motion import DifferentialDriveGeometry
+from motor_test_protocol import (
+    parse_motor_stop_message,
+    parse_motor_test_message,
+)
 
 
 # Match the main-control board's channel. The main board learns this ESP32's
@@ -35,8 +39,11 @@ START_HEADING_DEGREES = 0.0
 
 try:
     import motor_driver
-except ImportError:
+except Exception as error:
     motor_driver = None
+    sys.stdout.write("MOTOR_DRIVER_IMPORT_ERROR|%s\n" % str(error).replace("|", "/"))
+
+active_motor_test = None
 
 
 def make_geometry():
@@ -60,6 +67,83 @@ def send_reply(radio, peer_mac, message):
 def stop_motors():
     if motor_driver is not None and hasattr(motor_driver, "stop"):
         motor_driver.stop()
+
+
+def handle_motor_test_message(radio, peer_mac, text):
+    """Start or stop one short, acknowledged open-loop motor jog."""
+    global active_motor_test
+    if text.startswith("MOTOR_STOP|"):
+        token = "?"
+        try:
+            token = parse_motor_stop_message(text)
+            if active_motor_test is None:
+                stop_motors()
+                send_reply(radio, peer_mac, "MOTOR_TEST_STOPPED|%s|0" % token)
+                return
+            if token != active_motor_test["test_id"]:
+                send_reply(radio, peer_mac, "MOTOR_TEST_ERR|%s|ID_MISMATCH" % token)
+                return
+            elapsed = ticks_diff(ticks_ms(), active_motor_test["started_ms"])
+            stop_motors()
+            active_motor_test = None
+            send_reply(radio, peer_mac, "MOTOR_TEST_STOPPED|%s|%d" % (token, elapsed))
+        except Exception as error:
+            reason = str(error).replace("|", "/").replace(" ", "_")
+            send_reply(radio, peer_mac, "MOTOR_TEST_ERR|%s|%s" % (token, reason))
+        return
+
+    token = "?"
+    motors_touched = False
+    try:
+        command = parse_motor_test_message(text)
+        token = command["test_id"]
+        if active_motor_test is not None:
+            send_reply(radio, peer_mac, "MOTOR_TEST_ERR|%s|MOTOR_TEST_BUSY" % token)
+            return
+        if motor_driver is None or not hasattr(motor_driver, "set_motors"):
+            raise RuntimeError("MOTOR_DRIVER_MISSING")
+        if not hasattr(motor_driver, "MAX_DUTY_U16"):
+            raise RuntimeError("MOTOR_DRIVER_CONFIG_INVALID")
+        if command["duty_u16"] > motor_driver.MAX_DUTY_U16:
+            raise RuntimeError("DUTY_ABOVE_DRIVER_LIMIT")
+
+        motors_touched = True
+        stop_motors()
+        motor_driver.set_motors(
+            command["duty_u16"], command["direction_a"],
+            command["duty_u16"], command["direction_b"],
+        )
+        active_motor_test = {
+            "test_id": token,
+            "started_ms": ticks_ms(),
+            "duration_ms": command["duration_ms"],
+            "peer_mac": peer_mac,
+        }
+        send_reply(
+            radio, peer_mac,
+            "MOTOR_TEST_STARTED|%s|%d" % (token, command["duration_ms"]),
+        )
+    except Exception as error:
+        if motors_touched:
+            stop_motors()
+            if active_motor_test is not None and active_motor_test["test_id"] == token:
+                active_motor_test = None
+        reason = str(error).replace("|", "/").replace(" ", "_")
+        send_reply(radio, peer_mac, "MOTOR_TEST_ERR|%s|%s" % (token, reason))
+
+
+def service_motor_test(radio):
+    """Stop a jog at its deadline, even if no STOP packet is sent."""
+    global active_motor_test
+    if active_motor_test is None:
+        return
+    elapsed = ticks_diff(ticks_ms(), active_motor_test["started_ms"])
+    if elapsed >= active_motor_test["duration_ms"]:
+        token = active_motor_test["test_id"]
+        peer_mac = active_motor_test["peer_mac"]
+        stop_motors()
+        active_motor_test = None
+        send_reply(radio, peer_mac, "MOTOR_TEST_DONE|%s|%d" % (token, elapsed))
 
 
 def run_segment(segment, geometry):
@@ -176,6 +260,14 @@ def handle_radio_message(radio, sender_mac, raw_payload, geometry, last_done):
             send_reply(radio, sender_mac, "RADIO_PONG|" + token)
             return last_done
 
+        if text.startswith("MOTOR_TEST|") or text.startswith("MOTOR_STOP|"):
+            handle_motor_test_message(radio, sender_mac, text)
+            return last_done
+
+        if active_motor_test is not None:
+            send_reply(radio, sender_mac, "ERR|MOTOR_TEST|BUSY")
+            return last_done
+
         if text.startswith("TASK|"):
             fields = text.split("|")
             task_id = fields[1] if len(fields) > 1 else "?"
@@ -257,4 +349,5 @@ while True:
         last_done = handle_radio_message(
             radio, sender_mac, raw_payload, geometry, last_done
         )
+    service_motor_test(radio)
     sleep_ms(10)

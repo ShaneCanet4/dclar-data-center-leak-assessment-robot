@@ -14,7 +14,7 @@ planner; it is not a robot controller or a leak sensor.
 | Tile coverage | `search.py` | Creates zigzag or circle-spiral waypoints inside and beyond a selected 1 ft tile, using the 7 in × 5 in robot footprint. |
 | Simulation and data | `main.py` | Animates pivot-in-place and forward-only motion, accepts spill locations, shows the current command vector, and saves a JSON plan. |
 | USB serial link | `serial_link.py`, `serial_protocol.py` | Lists COM ports, connects the desktop app to the main-control ESP32, and formats text commands. |
-| ESP32 radio bridge and robot receiver | `esp32/` | Main-control USB/TFT bridge, robot ESP-NOW receiver, and differential-drive motion-segment receiver; timed motor control is planned but not implemented. |
+| ESP32 radio bridge and robot receiver | `esp32/` | Main-control USB/TFT bridge, robot ESP-NOW receiver, bounded open-loop motor jogs, and planner-segment placeholder. |
 | Communication checks | `test_serial_protocol.py`, `test_robot_motion.py`, `test_esp32_communication.py` | Unit-checks message formatting and the current motion-calculation placeholder, and tests USB PING/PONG. |
 | Living system architecture | `docs/system_design.tex` | Detailed architecture and data-flow description, current feature status, student design ownership, AI-assisted implementation contributions, and hardware limitations. Update this document alongside meaningful feature changes. |
 
@@ -119,10 +119,11 @@ path** to send planner output.
 
 ### Robot receiver and path execution protocol
 
-Copy `esp32/esp32_robot_control.py` and `esp32/robot_motion.py` to the robot
-ESP32 root using Thonny. Set both ESP32s to the same `WIFI_CHANNEL`; the main
-board also needs the robot's MAC in `ROBOT_MAC`. The robot learns the main
-board's MAC from its first radio packet.
+Copy `esp32/esp32_robot_control.py`, `esp32/robot_motion.py`,
+`esp32/motor_driver.py`, and `motor_test_protocol.py` to the robot ESP32 root
+using Thonny. Set both ESP32s to the same `WIFI_CHANNEL`; the main board also
+needs the robot's MAC in `ROBOT_MAC`. The robot learns the main board's MAC
+from its first radio packet.
 
 The desktop sends each planned vector entry as a simple f-string encoded line:
 
@@ -130,11 +131,52 @@ The desktop sends each planned vector entry as a simple f-string encoded line:
 SEG|mission_id|sequence|pivot_degrees|distance_ft|target_x_ft|target_y_ft|heading_degrees
 ```
 
-The bridge forwards the line over ESP-NOW. The current robot firmware parses motion segments but does not implement the intended open-loop timed PWM control. It still contains an earlier wheel-target placeholder and expects a separate motor backend; no motor commands should be treated as physical execution yet.
+The bridge forwards the line over ESP-NOW. Planner segments still use an earlier wheel-target placeholder and do not drive a calibrated timed path. The manual motor-jog feature below is a separate path and uses `esp32/motor_driver.py`.
 
 The intended design has no wheel-motion feedback. For straight travel, measure the assembled robot's average speed at a chosen PWM setting and estimate run time with `time = distance / measured_speed`. For a pivot, measure its average turn rate and estimate `time = abs(turn_angle) / measured_turn_rate`. ENA/ENB or equivalent driver inputs receive PWM/direction logic; the battery powers the motor driver's supply input, and the driver switches power to the motors. PWM controls the approximate applied motor power, while timed calibration estimates distance. A nominal 9 V battery must be checked against the motor and driver voltage/current ratings and the motor's startup/stall current.
 
-Because this is open loop, elapsed time does not confirm that the robot reached its target. Battery sag, floor friction, load, startup delay, and motor differences can change the distance and turn. The map pose is only the commanded estimate. Hardware-specific timed PWM execution, calibration, and safe stop behavior remain to be implemented.
+Because this is open loop, elapsed time does not confirm that the robot reached its target. Battery sag, floor friction, load, startup delay, and motor differences can change the distance and turn. The map pose is only the commanded estimate. Calibrated timed path execution remains to be implemented.
+
+### Robot ESP32 radio and motor jog test
+
+Open **Robot control / communication test** after connecting to the main-control
+ESP32. **Ping robot radio** sends a token to the robot MAC configured in
+`esp32_main_control.py`; a matching `RADIO_PONG` confirms the packet round trip.
+The motor jog controls send bounded packets in this format:
+
+```text
+RADIO_PING|token
+MOTOR_TEST|test_id|direction_a|direction_b|duty_u16|duration_ms
+MOTOR_STOP|test_id
+```
+
+The robot answers `RADIO_PING` with `RADIO_PONG|token`.
+The panel offers forward, reverse, pivot-left/right, and Motor A/B-only jogs.
+Choose duty from 1--75 percent and duration from 100--1500 ms. The default is
+30 percent for 400 ms. The robot acknowledges start and reports when the timer
+ends; the reply does not verify that a wheel moved. Check movement visually,
+starting with the drive wheels raised and one motor at a time. Wireless STOP is
+not an emergency disconnect.
+
+Example: `MOTOR_TEST|J0001|1|1|19660|400` commands both motors forward for
+400 ms at about 30 percent duty. The robot replies `MOTOR_TEST_STARTED|J0001|400`
+and then `MOTOR_TEST_DONE|J0001|elapsed_ms` when its timer expires. `MOTOR_STOP|J0001`
+disables PWM; the robot may coast rather than brake instantly.
+
+The driver uses GPIO26/25 for direction A, GPIO33/32 for direction B, and
+GPIO14/GPIO27 for 1 kHz PWM to ENA/ENB. Remove both ENA and ENB jumpers before
+connecting these GPIOs. GPIO assignments must be confirmed for the exact ESP32
+board; classic ESP32 modules use GPIO6--GPIO11 for flash and those pins must not
+be used as regular outputs.
+
+For an L298N module, connect a current-capable motor supply to its labeled motor
+input, connect grounds, and power the ESP32 separately over USB for initial
+tests. Never connect ESP32 3V3 to the driver's 5 V rail. Module regulator
+jumpers and 5 V terminal direction vary, so verify the exact board before
+using its 5 V rail. The firmware's 75 percent PWM ceiling is not a guarantee
+that a 3--6 V TT motor is protected: L298 output drop varies with current, and
+PWM applies supply-voltage pulses. Check the L298N, motor, and supply ratings;
+avoid a rectangular smoke-detector 9 V battery for motor power.
 
 The app's **Ping ESP32** button sends `PING|GUI####`, where `####` is an
 app-local counter (for example, `PING|GUI0022`). The `GUI` prefix identifies
@@ -224,14 +266,33 @@ channel, and running firmware that understands the text protocol.
    the robot firmware. A `TX` line confirms only that the main ESP32 sent a
    packet; a matching robot reply confirms the radio round trip.
 3. Do not treat a planned `SEG` as motor execution. The current robot firmware
-   has no timed PWM driver and may reply with `ERR` when motion configuration
-   is missing. The open-loop timed motor implementation is future work.
+   has no calibrated path-segment timing handler and may reply with `ERR` when
+   legacy motion configuration is missing. Timed planner-path execution is future work.
 
 Pass condition: the matching radio-ping reply is visible on the main board and
-in the desktop log. When timed motor control is implemented, `DONE` will mean
-the requested timer elapsed, not that the robot reached its planned location.
+in the desktop log. Planner-path `DONE` semantics are not implemented by the
+manual motor-jog feature.
 
-#### 5. Validate path completion behavior
+#### 5. Test motor jog packets
+
+1. Confirm the L298N wiring, remove ENA/ENB jumpers, and raise the drive wheels.
+2. Connect the main-control ESP32, then press **Ping robot radio** and confirm
+   a matching `RADIO_PONG` in the activity log.
+3. Send Motor A-only and Motor B-only jogs at the default 30 percent for 400 ms.
+   Confirm each selected motor turns; visually check direction and abnormal
+   noise or heating. Use **STOP motors** to send a stop packet.
+4. Try the short forward and pivot jogs only after both individual motors work.
+
+Pass condition: the robot replies to each packet and the expected motor(s) are
+visibly turning. The software reply alone cannot verify motor movement. Remove
+the battery if a motor keeps running or the driver becomes hot.
+
+Forward/pivot labels assume both channel wiring directions match. If a motor
+turns the wrong way, set its `MOTOR_A_DIRECTION_INVERTED` or
+`MOTOR_B_DIRECTION_INVERTED` option in `esp32/motor_driver.py` after checking
+each channel separately.
+
+#### 6. Validate path completion behavior
 
 Only after all segments have matching `DONE` replies does the app mark the
 target searched. Robot setup errors, stale mission IDs, and wrong sequence
