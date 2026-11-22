@@ -128,6 +128,9 @@ pending_robot_ping_tokens = set()
 next_motor_test_id = 1
 next_robot_ping_id = 1
 active_motor_test_token = None
+fake_robot_mode = False
+fake_robot_mode_pending = None
+fake_mode_button_text = None
 motor_test_status_text = None
 last_serial_port_signature = None
 hardware_mission_counter = 1
@@ -1463,13 +1466,16 @@ def handle_robot_radio_event(line):
             append_serial_log("Ignored unmatched robot radio ping: " + token)
         return
     if kind.startswith("MOTOR_TEST_") and len(robot_fields) >= 2:
+        is_local = fields[1] == "LOCAL"
         token = robot_fields[1]
         if token not in pending_motor_test_tokens:
             append_serial_log("Ignored unmatched motor-test reply: " + fields[2])
             return
         if kind == "MOTOR_TEST_STARTED":
             duration = robot_fields[2] if len(robot_fields) >= 3 else "?"
-            message = "Jog running (%s ms). Watch the robot." % duration
+            message = "%s jog running (%s ms). Watch the motors." % (
+                "Local" if is_local else "Robot", duration
+            )
             if motor_test_status_text is not None:
                 motor_test_status_text.set(message)
             append_serial_log("Robot acknowledged motor jog %s" % token)
@@ -1479,9 +1485,11 @@ def handle_robot_radio_event(line):
             active_motor_test_token = None
         detail = robot_fields[2] if len(robot_fields) >= 3 else ""
         if kind == "MOTOR_TEST_DONE":
-            message = "Timed jog ended; visually inspect motion (no wheel feedback)."
+            message = "%s timed jog ended; visually inspect motion (no wheel feedback)." % (
+                "Local" if is_local else "Robot"
+            )
         elif kind == "MOTOR_TEST_STOPPED":
-            message = "Robot acknowledged motor stop."
+            message = "%s acknowledged motor stop." % ("Control board" if is_local else "Robot")
         else:
             message = "Motor-test error: %s" % detail
         if motor_test_status_text is not None:
@@ -1572,6 +1580,7 @@ def start_hardware_path():
 
 def poll_serial_events():
     """Move background serial-reader events onto Tkinter's UI thread."""
+    global fake_robot_mode, fake_robot_mode_pending
     if esp32_link is not None:
         while True:
             try:
@@ -1580,6 +1589,10 @@ def poll_serial_events():
                 break
             append_serial_log("ESP32 -> PC: " + line)
             if line.startswith("READY|"):
+                fake_robot_mode = False
+                fake_robot_mode_pending = None
+                if fake_mode_button_text is not None:
+                    fake_mode_button_text.set("Enable fake robot mode")
                 serial_status_text.set("Connected to %s; board ready" % esp32_link.port)
             elif line.startswith("PONG|"):
                 token = line.split("|", 1)[1]
@@ -1588,8 +1601,28 @@ def poll_serial_events():
                     serial_status_text.set("ESP32 identified; USB ping passed")
                 else:
                     serial_status_text.set("Unexpected PONG token: %s" % token)
+            elif line.startswith("MODE|FAKE_ROBOT|"):
+                fake_robot_mode = line.endswith("|ON")
+                fake_robot_mode_pending = None
+                if fake_mode_button_text is not None:
+                    fake_mode_button_text.set(
+                        "Disable fake robot mode" if fake_robot_mode
+                        else "Enable fake robot mode"
+                    )
+                if motor_test_status_text is not None:
+                    motor_test_status_text.set(
+                        "FAKE ROBOT MODE ON: control-board motor outputs are active."
+                        if fake_robot_mode else "Fake robot mode OFF; motor jogs go over ESP-NOW."
+                    )
+            elif line.startswith("ERROR|MOTOR_DRIVER|"):
+                fake_robot_mode_pending = None
+                if motor_test_status_text is not None:
+                    motor_test_status_text.set("Fake mode failed: %s" % line.split("|", 2)[2])
             elif line.startswith("RX|"):
-                serial_status_text.set("Robot radio message received")
+                serial_status_text.set(
+                    "Local motor-test response received"
+                    if line.startswith("RX|LOCAL|") else "Robot radio message received"
+                )
                 handle_robot_radio_event(line)
             elif line.startswith("TX_FAIL|") or line.startswith("ERROR|"):
                 serial_status_text.set(line)
@@ -1602,6 +1635,7 @@ def open_robot_control():
     """Open task, coordinate, and USB communication controls in a child window."""
     global control_window, control_log, next_task_id, next_ping_id
     global next_motor_test_id, next_robot_ping_id
+    global fake_mode_button_text
     global active_motor_test_token, motor_test_status_text
     if control_window is not None and control_window.winfo_exists():
         control_window.deiconify()
@@ -1706,11 +1740,11 @@ def open_robot_control():
         row=3, column=3, padx=(6, 0), sticky="e"
     )
 
-    motor_frame = ttk.LabelFrame(control_window, text="Robot ESP32 motor jog test", padding=10)
+    motor_frame = ttk.LabelFrame(control_window, text="Robot / local motor jog test", padding=10)
     motor_frame.grid(row=4, column=0, padx=10, pady=4, sticky="ew")
     ttk.Label(
         motor_frame,
-        text="Short open-loop packets go to the robot MAC configured in the main-control ESP32.",
+        text="Enable fake robot mode to run these short motor jogs directly from the control board.",
         wraplength=630,
     ).grid(row=0, column=0, columnspan=5, sticky="w")
     ttk.Label(motor_frame, text="PWM duty (%)").grid(row=1, column=0, pady=(8, 0), sticky="w")
@@ -1731,6 +1765,9 @@ def open_robot_control():
         if esp32_link is None:
             motor_test_status_text.set("Connect to the main-control ESP32 first.")
             return
+        if fake_robot_mode:
+            motor_test_status_text.set("Fake robot mode is active; radio ping is not used for local motors.")
+            return
         token = "RP%04d" % next_robot_ping_id
         message = make_robot_radio_ping_message(token)
         if send_esp32_line(message):
@@ -1748,6 +1785,39 @@ def open_robot_control():
 
             window.after(1500, radio_ping_timeout)
 
+    fake_mode_button_text = tk.StringVar(value=(
+        "Disable fake robot mode" if fake_robot_mode else "Enable fake robot mode"
+    ))
+
+    def toggle_fake_robot_mode():
+        global fake_robot_mode_pending
+        if esp32_link is None:
+            motor_test_status_text.set("Connect to the main-control ESP32 first.")
+            return
+        if fake_robot_mode_pending is not None:
+            motor_test_status_text.set("Waiting for control-board mode confirmation.")
+            return
+        if active_motor_test_token is not None:
+            motor_test_status_text.set("Wait for the active jog or press STOP before changing mode.")
+            return
+        requested = not fake_robot_mode
+        if send_esp32_line("FAKE_ROBOT|%s" % ("ON" if requested else "OFF")):
+            fake_robot_mode_pending = requested
+            motor_test_status_text.set("Waiting for TFT/control-board mode confirmation...")
+
+            def mode_confirm_timeout():
+                global fake_robot_mode_pending
+                if fake_robot_mode_pending == requested:
+                    fake_robot_mode_pending = None
+                    motor_test_status_text.set(
+                        "No mode confirmation. Update/restart the control-board firmware and check USB."
+                    )
+
+            window.after(2500, mode_confirm_timeout)
+
+    ttk.Button(motor_frame, textvariable=fake_mode_button_text, command=toggle_fake_robot_mode).grid(
+        row=2, column=3, padx=(8, 0), sticky="ew"
+    )
     ttk.Button(motor_frame, text="Ping robot radio", command=send_robot_radio_ping).grid(
         row=2, column=4, padx=(8, 0), sticky="w"
     )
@@ -1781,6 +1851,9 @@ def open_robot_control():
         if esp32_link is None:
             if motor_test_status_text is not None:
                 motor_test_status_text.set("Connect to the main-control ESP32 first.")
+            return
+        if fake_robot_mode_pending is not None:
+            motor_test_status_text.set("Wait for fake robot mode confirmation before jogging.")
             return
         if hardware_mission_id is not None:
             motor_test_status_text.set("Stop or finish the planned path before a motor jog.")

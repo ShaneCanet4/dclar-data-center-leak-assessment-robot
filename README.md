@@ -169,6 +169,37 @@ connecting these GPIOs. GPIO assignments must be confirmed for the exact ESP32
 board; classic ESP32 modules use GPIO6--GPIO11 for flash and those pins must not
 be used as regular outputs.
 
+### Local motor test on the main-control Feather
+
+The desktop **Robot control / communication test** window can also test motors
+from the main-control Adafruit ESP32-S3 TFT Feather without a second robot
+ESP32. Connect the motor driver to the main-control Feather; the robot ESP32
+does not need to be plugged in for local jogs. Copy
+`esp32/esp32_main_control.py` to the Feather as `/main.py`, plus
+`esp32/board_display.py`, `esp32/main_control_motor_driver.py`,
+`motor_test_protocol.py`, `st7789py.py`, and `vga1_16x32.py` to the device root.
+The last two display modules are the same upstream files listed above. The
+robot's `esp32/motor_driver.py`, `esp32/robot_motion.py`, and
+`esp32/esp32_robot_control.py` are not used in this mode.
+
+In the desktop control window, click **Enable fake robot mode**. Wait for the
+board display to show **FAKE ROBOT ON** and the app to report that the
+control-board motor outputs are active. That acknowledgement means the local
+driver module loaded and fake mode is enabled; the desktop then routes the
+existing bounded Forward/Reverse/Pivot/Motor A/B/STOP jog commands to the
+control board's own GPIO pins. Fake mode resets to OFF whenever the board
+restarts. Click **Disable fake robot mode** to return motor jogs to the normal
+ESP-NOW robot path.
+
+For this main-control board only, wire L298N direction inputs to Feather
+GPIO5/GPIO6 (Motor A), GPIO9/GPIO10 (Motor B), and its enable inputs ENA/ENB
+to GPIO11/GPIO12 respectively. Remove both ENA/ENB jumpers. These are Feather
+header pins D5, D6, D9, D10, D11, and D12; see the [Adafruit ESP32-S3 TFT
+Feather pinout](https://learn.adafruit.com/adafruit-esp32-s3-tft-feather/pinouts).
+Keep motor power on the motor driver's rated supply and share ground with the
+Feather. Start with the drive wheels raised and low duty. The timed software
+stop is not a physical emergency stop; keep motor power easy to disconnect.
+
 For an L298N module, connect a current-capable motor supply to its labeled motor
 input, connect grounds, and power the ESP32 separately over USB for initial
 tests. Never connect ESP32 3V3 to the driver's 5 V rail. Module regulator
