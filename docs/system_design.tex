@@ -134,6 +134,7 @@ Mission coordination & \texttt{main.py} & Owns the map state, runs the GUI, crea
 Map routing & \texttt{route.py} & Represents rack cells as obstacles and uses BFS to find shortest four-direction paths.\\
 Tile coverage & \texttt{search.py} & Generates ordered zigzag or circle-spiral waypoints for one tile.\\
 USB communication & \texttt{serial\_link.py}, \texttt{serial\_protocol.py} & Finds serial ports, opens the desktop-to-ESP32 connection, and formats messages.\\
+Motor-test protocol & \texttt{esp32/motor\_test\_protocol.py} & Defines bounded motor-test and stop messages shared by the desktop and both firmware targets.\\
 Radio bridge and local mode & \texttt{esp32/esp32\_main\_control.py} & Receives USB serial lines, forwards commands over ESP-NOW in normal mode, and locally handles bounded motor jogs in fake-robot mode.\\
 Robot receiver & \texttt{esp32/esp32\_robot\_control.py} & Receives radio messages and executes bounded motor-jog packets; planner path execution remains a placeholder.\\
 Motion conversion & \texttt{esp32/robot\_motion.py} & Contains an earlier wheel-target placeholder; calibrated timed path conversion is future work.\\
@@ -389,19 +390,19 @@ The main-control ESP32 runs MicroPython and acts as the USB-to-ESP-NOW bridge. I
 \begin{itemize}
     \item \texttt{esp32/esp32\_main\_control.py};
     \item \texttt{esp32/board\_display.py};
-    \item \texttt{st7789py.py};
-    \item \texttt{vga1\_16x32.py}.
+    \item \texttt{esp32/st7789py.py} (downloaded upstream display driver);
+    \item \texttt{esp32/vga1\_16x32.py} (downloaded upstream font module).
 \end{itemize}
 
 Save \texttt{esp32\_main\_control.py} on the device as \texttt{/main.py} so it starts after reset. The other listed files should also be in the device root. Set \texttt{WIFI\_CHANNEL} to the channel used by the robot and replace \texttt{ROBOT\_MAC} with the robot's six-byte MAC address. After reset, the serial output should report \texttt{READY|channel|mac}. If the board returns to the MicroPython REPL prompt instead, the bridge loop is not running.
 
 The display configuration in the firmware uses the Feather ESP32-S3 TFT pin assignments: power GPIO21, CS GPIO7, DC GPIO39, reset GPIO40, backlight GPIO45, and SPI SCK/MOSI GPIO36/GPIO35. These are firmware configuration details and should be checked against the actual board before wiring.
 
-To enable local fake-robot motor testing, also copy \texttt{esp32/main\_control\_motor\_driver.py} and \texttt{motor\_test\_protocol.py} to the main-control device root. The complete root-file set is therefore \texttt{/main.py}, \texttt{/board\_display.py}, \texttt{/main\_control\_motor\_driver.py}, \texttt{/motor\_test\_protocol.py}, \texttt{/st7789py.py}, and \texttt{/vga1\_16x32.py}. The Feather-specific motor driver is imported only when the GUI requests fake mode. A main-control-only motor test needs this board, the desktop app, and a correctly wired motor driver; it does not need the robot ESP32. The normal radio bridge still needs a configured robot MAC when radio operation is intended.
+To enable local fake-robot motor testing, also copy \texttt{esp32/main\_control\_motor\_driver.py} and \texttt{esp32/motor\_test\_protocol.py} to the main-control device root. The complete root-file set is therefore \texttt{/main.py}, \texttt{/board\_display.py}, \texttt{/main\_control\_motor\_driver.py}, \texttt{/motor\_test\_protocol.py}, \texttt{/st7789py.py}, and \texttt{/vga1\_16x32.py}. The last two source files are downloaded from upstream into the computer's \texttt{esp32/} folder; all project-owned MicroPython source is grouped there as well. The Feather-specific motor driver is imported only when the GUI requests fake mode. A main-control-only motor test needs this board, the desktop app, and a correctly wired motor driver; it does not need the robot ESP32. The normal radio bridge still needs a configured robot MAC when radio operation is intended.
 
 \subsection{Robot ESP32 Setup}
 
-Copy \texttt{esp32/esp32\_robot\_control.py}, \texttt{esp32/robot\_motion.py}, \texttt{esp32/motor\_driver.py}, and \texttt{motor\_test\_protocol.py} to the robot ESP32 root using Thonny. Both ESP32 boards must use the same \texttt{WIFI\_CHANNEL}. The main-control board must contain the robot's MAC address. The robot receiver learns the main-control board's MAC from its first radio packet.
+Copy \texttt{esp32/esp32\_robot\_control.py}, \texttt{esp32/robot\_motion.py}, \texttt{esp32/motor\_driver.py}, and \texttt{esp32/motor\_test\_protocol.py} to the robot ESP32 root using Thonny. Both ESP32 boards must use the same \texttt{WIFI\_CHANNEL}. The main-control board must contain the robot's MAC address. The robot receiver learns the main-control board's MAC from its first radio packet.
 
 \subsection{L298N Motor Bridge Wiring and Limits}
 

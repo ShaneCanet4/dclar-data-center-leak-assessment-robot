@@ -18,6 +18,10 @@ planner; it is not a robot controller or a leak sensor.
 | Communication checks | `test_serial_protocol.py`, `test_robot_motion.py`, `test_esp32_communication.py` | Unit-checks message formatting and the current motion-calculation placeholder, and tests USB PING/PONG. |
 | Living system architecture | `docs/system_design.tex` | Detailed architecture and data-flow description, current feature status, student design ownership, AI-assisted implementation contributions, and hardware limitations. Update this document alongside meaningful feature changes. |
 
+Project-owned MicroPython source files are grouped in `esp32/`. When deploying,
+copy the selected board's modules from that folder to the ESP32 device root;
+the board does not use an `esp32/` subfolder.
+
 ## ESP32 main-control bridge
 
 `esp32/esp32_main_control.py` is MicroPython firmware for the main-control ESP32.
@@ -33,7 +37,9 @@ only after all its segments report completion.
 2. In Thonny, select **MicroPython (ESP32)** and the board's COM port. Copy
    `esp32/esp32_main_control.py` and `esp32/board_display.py` to the MicroPython device.
    `board_display.py` uses the same display driver and font as the known-working
-   board test: also copy `st7789py.py` and `vga1_16x32.py` to the device root.
+   board test: download `st7789py.py` and `vga1_16x32.py` from the upstream
+   links below and save them in the local `esp32/` folder, then copy them to
+   the device root.
    They are in the upstream [ST7789 MicroPython driver](https://github.com/russhughes/st7789py_mpy/tree/master/lib)
    and its [ROM font folder](https://github.com/russhughes/st7789py_mpy/tree/master/romfonts).
    If the board was erased while flashing MicroPython, copy all four files again.
@@ -78,7 +84,7 @@ Thonny's Shell/serial session before connecting from the app.
 
 The USB bridge must be running on the main-control ESP32. In Thonny, save
 `esp32/esp32_main_control.py` to the device as `/main.py`, with
-`board_display.py`, `st7789py.py`, and `vga1_16x32.py` at the device root, then
+`esp32/board_display.py`, `esp32/st7789py.py`, and `esp32/vga1_16x32.py` at the device root, then
 reset the board. The serial output should show `READY|channel|mac` and remain
 in the bridge loop. A `>>>` prompt means the program returned to the REPL; a
 line like `PING|GUI0001` typed or sent at that prompt is treated as Python and
@@ -120,7 +126,7 @@ path** to send planner output.
 ### Robot receiver and path execution protocol
 
 Copy `esp32/esp32_robot_control.py`, `esp32/robot_motion.py`,
-`esp32/motor_driver.py`, and `motor_test_protocol.py` to the robot ESP32 root
+`esp32/motor_driver.py`, and `esp32/motor_test_protocol.py` to the robot ESP32 root
 using Thonny. Set both ESP32s to the same `WIFI_CHANNEL`; the main board also
 needs the robot's MAC in `ROBOT_MAC`. The robot learns the main board's MAC
 from its first radio packet.
@@ -177,8 +183,9 @@ ESP32. Connect the motor driver to the main-control Feather; the robot ESP32
 does not need to be plugged in for local jogs. Copy
 `esp32/esp32_main_control.py` to the Feather as `/main.py`, plus
 `esp32/board_display.py`, `esp32/main_control_motor_driver.py`,
-`motor_test_protocol.py`, `st7789py.py`, and `vga1_16x32.py` to the device root.
-The last two display modules are the same upstream files listed above. The
+`esp32/motor_test_protocol.py`, `esp32/st7789py.py`, and `esp32/vga1_16x32.py` to the device root.
+The last two display modules are upstream dependencies; keep local copies in
+`esp32/` alongside the project firmware. The
 robot's `esp32/motor_driver.py`, `esp32/robot_motion.py`, and
 `esp32/esp32_robot_control.py` are not used in this mode.
 
@@ -256,7 +263,7 @@ target signs. They do not open a COM port or drive motors.
 #### 2. Check the USB serial round trip
 
 1. Flash/run `esp32/esp32_main_control.py` on the main-control ESP32, with
-   `esp32/board_display.py`, `st7789py.py`, and `vga1_16x32.py` copied to the board.
+   `esp32/board_display.py`, `esp32/st7789py.py`, and `esp32/vga1_16x32.py` copied to the board.
 2. Close Thonny's serial connection so it releases the COM port. Connect the
    board to the computer with a USB data cable.
 3. Run `python test_esp32_communication.py`. Select the COM port shown for the

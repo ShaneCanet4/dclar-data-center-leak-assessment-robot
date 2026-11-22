@@ -1,7 +1,8 @@
 """Robot-side ESP-NOW receiver with bounded open-loop motor-jog packets.
 
 Copy this file, robot_motion.py, motor_driver.py, and motor_test_protocol.py to
-the robot ESP32. The MOTOR_TEST path uses direction pins and PWM for a short,
+the robot ESP32 root (the host-side source for each is in this esp32 folder).
+The MOTOR_TEST path uses direction pins and PWM for a short,
 validated duration. The older SEG/MOVE path remains a separate placeholder and
 does not provide calibrated timed travel.
 """

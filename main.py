@@ -47,7 +47,7 @@ from serial_protocol import (
     make_segment_message,
     make_task_message,
 )
-from motor_test_protocol import (
+from esp32.motor_test_protocol import (
     MAX_MOTOR_TEST_DURATION_MS,
     make_motor_stop_message,
     make_motor_test_message,
