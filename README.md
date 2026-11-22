@@ -169,11 +169,14 @@ Example: `MOTOR_TEST|J0001|1|1|19660|400` commands both motors forward for
 and then `MOTOR_TEST_DONE|J0001|elapsed_ms` when its timer expires. `MOTOR_STOP|J0001`
 disables PWM; the robot may coast rather than brake instantly.
 
-The driver uses GPIO26/25 for direction A, GPIO33/32 for direction B, and
-GPIO14/GPIO27 for 1 kHz PWM to ENA/ENB. Remove both ENA and ENB jumpers before
-connecting these GPIOs. GPIO assignments must be confirmed for the exact ESP32
-board; classic ESP32 modules use GPIO6--GPIO11 for flash and those pins must not
-be used as regular outputs.
+Both motor-driver modules now use the same Adafruit ESP32-S3 TFT Feather
+mapping: GPIO5/GPIO6 for Motor A direction, GPIO9/GPIO10 for Motor B direction,
+and GPIO11/GPIO12 for 1 kHz PWM to ENA/ENB. Remove both ENA and ENB jumpers
+before connecting these GPIOs. This shared mapping makes the motor-driver
+wiring the same on the main-control and robot Feather boards. It is specific to
+the Feather ESP32-S3 shown in the pinout; do not use it on a classic ESP32
+module, where some of these pins are reserved for flash or unavailable. Verify
+the exact robot board before connecting any GPIOs.
 
 ### Local motor test on the main-control Feather
 
@@ -198,11 +201,10 @@ control board's own GPIO pins. Fake mode resets to OFF whenever the board
 restarts. Click **Disable fake robot mode** to return motor jogs to the normal
 ESP-NOW robot path.
 
-For this main-control board only, wire L298N direction inputs to Feather
-GPIO5/GPIO6 (Motor A), GPIO9/GPIO10 (Motor B), and its enable inputs ENA/ENB
-to GPIO11/GPIO12 respectively. Remove both ENA/ENB jumpers. These are Feather
-header pins D5, D6, D9, D10, D11, and D12; see the [Adafruit ESP32-S3 TFT
-Feather pinout](https://learn.adafruit.com/adafruit-esp32-s3-tft-feather/pinouts).
+Wire the motor driver to Feather GPIO5/GPIO6 (Motor A direction),
+GPIO9/GPIO10 (Motor B direction), and GPIO11/GPIO12 (ENA/ENB PWM). Remove both
+ENA/ENB jumpers. These are Feather header pins D5, D6, D9, D10, D11, and D12;
+see the [Adafruit ESP32-S3 TFT Feather pinout](https://learn.adafruit.com/adafruit-esp32-s3-tft-feather/pinouts).
 Keep motor power on the motor driver's rated supply and share ground with the
 Feather. Start with the drive wheels raised and low duty. The timed software
 stop is not a physical emergency stop; keep motor power easy to disconnect.

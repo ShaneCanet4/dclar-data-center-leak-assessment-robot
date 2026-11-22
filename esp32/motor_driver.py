@@ -1,7 +1,9 @@
-"""L298N-style open-loop dual DC motor output for the robot ESP32.
+"""L298N-style open-loop motor output for an Adafruit ESP32-S3 TFT Feather.
 
-Verify all GPIOs and the exact L298N module before wiring. Remove the module's
-ENA/ENB jumpers before connecting GPIO14/GPIO27 to those inputs.
+This uses the same pins as main_control_motor_driver.py so either Feather can
+use the same motor-driver wiring. Do not use this map on a classic ESP32 board:
+GPIO6, GPIO9, GPIO10, and GPIO11 may be reserved or unavailable there. Remove
+the ENA/ENB jumpers before wiring GPIO11/GPIO12 to those inputs.
 """
 
 from machine import Pin, PWM
@@ -12,12 +14,13 @@ MAX_DUTY_U16 = 49151  # Software ceiling; not a guarantee of safe motor voltage.
 MOTOR_A_DIRECTION_INVERTED = False
 MOTOR_B_DIRECTION_INVERTED = False
 
-in1 = Pin(26, Pin.OUT, value=0)
-in2 = Pin(25, Pin.OUT, value=0)
-in3 = Pin(33, Pin.OUT, value=0)
-in4 = Pin(32, Pin.OUT, value=0)
-ena = PWM(Pin(14), freq=PWM_FREQUENCY_HZ, duty_u16=0)
-enb = PWM(Pin(27), freq=PWM_FREQUENCY_HZ, duty_u16=0)
+# Match the main-control Feather's local driver pin map.
+in1 = Pin(5, Pin.OUT, value=0)
+in2 = Pin(6, Pin.OUT, value=0)
+in3 = Pin(9, Pin.OUT, value=0)
+in4 = Pin(10, Pin.OUT, value=0)
+ena = PWM(Pin(11), freq=PWM_FREQUENCY_HZ, duty_u16=0)
+enb = PWM(Pin(12), freq=PWM_FREQUENCY_HZ, duty_u16=0)
 
 
 def _set_channel(pwm, direction_a, direction_b, speed, direction):
