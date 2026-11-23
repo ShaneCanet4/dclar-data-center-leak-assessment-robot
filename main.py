@@ -1474,8 +1474,10 @@ def start_selected_mode():
     run_mode_button.configure(text="Checking links…", state="disabled")
     if esp32_link is None:
         hardware_preflight_stage = "usb"
-        run_mode_button.configure(text="Connect ESP32 first", state="normal")
-        serial_status_text.set("Robot mode selected. Connect and identify the main-control ESP32.")
+        run_mode_button.configure(text="Start", state="normal")
+        serial_status_text.set(
+            "Robot mode selected. Click Connect + identify in the USB link below; this Start button does not open the COM port."
+        )
         return
     if not usb_link_ready:
         hardware_preflight_stage = "usb"
