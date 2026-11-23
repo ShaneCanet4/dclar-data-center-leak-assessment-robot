@@ -7,11 +7,15 @@ relays robot replies to both USB serial and the built-in TFT display.
 Examples:
     Computer -> board: PING|abc123
     Board -> computer: PONG|abc123
-    Computer -> board: TASK|1|0|0|Zigzag
-    Robot -> board:    DONE|1|0|0
+    Computer -> board: MISSION_START|H0001|0|0|Zigzag|18
+    Computer -> board: SEG|H0001|0|...
+    Robot -> board:    DONE|H0001|0|x|y|heading
+    Robot -> board:    TILE_DONE|H0001|0|0|18
 
 Use the same Wi-Fi channel on both ESP32s. Keep radio messages at or below
-240 encoded bytes. See README.md for the text protocol and board setup.
+240 encoded bytes. The bridge forwards tile manifests, individual segments,
+and the robot's confirmations without owning the mission state. See README.md
+for the text protocol and board setup.
 """
 
 import network

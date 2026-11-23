@@ -12,10 +12,10 @@ planner; it is not a robot controller or a leak sensor.
 | --- | --- | --- |
 | Map routing | `route.py` | Builds the rack map and uses breadth-first search (BFS) to find shortest four-direction paths around blocked tiles. |
 | Tile coverage | `search.py` | Creates zigzag or circle-spiral waypoints inside and beyond a selected 1 ft tile, using the 7 in × 5 in robot footprint. |
-| Simulation and data | `main.py` | Animates pivot-in-place and forward-only motion, accepts spill locations, shows the current command vector, and saves a JSON plan. |
+| Simulation and data | `main.py` | Requires an explicit Simulation or Robot hardware run mode, accepts spill locations, shows the current command vector, and saves a JSON plan. |
 | USB serial link | `serial_link.py`, `serial_protocol.py` | Lists COM ports, connects the desktop app to the main-control ESP32, and formats text commands. |
-| ESP32 radio bridge and robot receiver | `esp32/` | Main-control USB/TFT bridge, robot ESP-NOW receiver, bounded open-loop motor jogs, and planner-segment placeholder. |
-| Communication checks | `test_serial_protocol.py`, `test_robot_motion.py`, `test_esp32_communication.py` | Unit-checks message formatting and the current motion-calculation placeholder, and tests USB PING/PONG. |
+| ESP32 radio bridge and robot receiver | `esp32/` | Main-control USB/TFT bridge, robot ESP-NOW receiver, bounded motor jogs, and a manifest/segment/tile-completion protocol for calibrated timed paths. |
+| Communication checks | `test_serial_protocol.py`, `test_robot_motion.py`, `test_esp32_communication.py` | Unit-checks existing message helpers and geometry calculations, and provides a USB PING/PONG check. The tile transaction still needs end-to-end hardware validation. |
 | Living system architecture | `docs/system_design.tex` | Detailed architecture and data-flow description, current feature status, student design ownership, AI-assisted implementation contributions, and hardware limitations. Update this document alongside meaningful feature changes. |
 
 Project-owned MicroPython source files are grouped in `esp32/`. When deploying,
@@ -25,10 +25,13 @@ the board does not use an `esp32/` subfolder.
 ## ESP32 main-control bridge
 
 `esp32/esp32_main_control.py` is MicroPython firmware for the main-control ESP32.
-The desktop `main.py` selects a USB serial port and sends commands to the main
-board. **Send planned path** streams one segment at a time and waits for the
-matching robot `DONE` before sending the next. A target is marked searched
-only after all its segments report completion.
+The desktop `main.py` starts paused and asks the operator to select a run mode.
+**Simulation** animates the map on the computer. **Robot hardware (ESP-NOW)**
+requires a matching USB PING/PONG and robot radio PONG before declaring a tile
+path. The desktop sends a tile manifest, streams one segment at a time, and
+marks the tile searched only after the matching robot `TILE_DONE` confirmation.
+The separate **fake robot mode** in the jog panel means local motor-driver GPIO
+testing on the main-control Feather; it is not a simulated map run.
 
 ### Configure and run
 
@@ -125,23 +128,66 @@ path** to send planner output.
 
 ### Robot receiver and path execution protocol
 
-Copy `esp32/esp32_robot_control.py`, `esp32/robot_motion.py`,
-`esp32/motor_driver.py`, and `esp32/motor_test_protocol.py` to the robot ESP32 root
-using Thonny. Set both ESP32s to the same `WIFI_CHANNEL`; the main board also
-needs the robot's MAC in `ROBOT_MAC`. The robot learns the main board's MAC
-from its first radio packet.
+Copy `esp32/esp32_robot_control.py`, `esp32/motor_driver.py`, and
+`esp32/motor_test_protocol.py` to the robot ESP32 root using Thonny.
+`robot_motion.py` is an offline geometry helper and is not required by this
+firmware. Set both ESP32s to the same `WIFI_CHANNEL`; the main board also needs
+the robot's MAC in `ROBOT_MAC`. The robot learns the main board's MAC from its
+first radio packet.
 
-The desktop sends each planned vector entry as a simple f-string encoded line:
+Robot hardware mode has a two-hop startup check. The desktop first identifies
+the main-control board over USB with matching `PING|token` / `PONG|token`. It
+then sends `RADIO_PING|token` through the bridge. The robot replies with a
+path-readiness status and its commanded pose, for example
+`RADIO_PONG|token|PATH_READY|POSE_VALID|0.5000|0.5000|0.00`. It reports
+`PATH_NOT_CONFIGURED` when calibration/driver setup is missing or
+`POSE_UNKNOWN` after a robot-side jog or interrupted movement. The desktop
+checks pose agreement before it sends a tile path. A radio reply alone never
+starts a motor. Place the robot at its configured start pose before rebooting;
+the reported pose is not measured by a sensor.
+
+For each tile, the desktop sends a manifest describing the route and expected
+segment count, then streams each planned vector entry after the preceding
+segment is acknowledged:
+
+```text
+MISSION_START|mission_id|tile_row|tile_column|pattern|segment_count
+```
+
+For example, `MISSION_START|H0001|0|0|Zigzag|18` declares tile row 0, column 0
+with 18 ordered segments. The robot validates the path setup and replies
+`MISSION_READY|H0001|18`. Each segment is then sent as:
 
 ```text
 SEG|mission_id|sequence|pivot_degrees|distance_ft|target_x_ft|target_y_ft|heading_degrees
 ```
 
-The bridge forwards the line over ESP-NOW. Planner segments still use an earlier wheel-target placeholder and do not drive a calibrated timed path. The manual motor-jog feature below is a separate path and uses `esp32/motor_driver.py`.
+The bridge forwards every message unchanged over ESP-NOW. The robot checks the
+mission ID and sequence, executes a pivot followed by a straight drive using
+the configured open-loop rates, and replies to each segment:
 
-The intended design has no wheel-motion feedback. For straight travel, measure the assembled robot's average speed at a chosen PWM setting and estimate run time with `time = distance / measured_speed`. For a pivot, measure its average turn rate and estimate `time = abs(turn_angle) / measured_turn_rate`. ENA/ENB or equivalent driver inputs receive PWM/direction logic; the battery powers the motor driver's supply input, and the driver switches power to the motors. PWM controls the approximate applied motor power, while timed calibration estimates distance. A nominal 9 V battery must be checked against the motor and driver voltage/current ratings and the motor's startup/stall current.
+```text
+RECEIVED|mission_id|sequence
+DONE|mission_id|sequence|estimated_x_ft|estimated_y_ft|estimated_heading_degrees
+```
 
-Because this is open loop, elapsed time does not confirm that the robot reached its target. Battery sag, floor friction, load, startup delay, and motor differences can change the distance and turn. The map pose is only the commanded estimate. Calibrated timed path execution remains to be implemented.
+After the declared final sequence, the robot checks that the commanded endpoint
+matches the declared tile center, then sends
+`TILE_DONE|mission_id|tile_row|tile_column|segment_count`. Only a matching
+`TILE_DONE` causes the GUI to mark the tile searched and move its target to the
+next tile. `TX`, `MISSION_READY`, `RECEIVED`, and intermediate `DONE` messages
+do not complete the tile. A failed segment, timeout, or operator stop sends
+`MISSION_STOP|mission_id` and leaves the tile incomplete.
+
+The robot has no wheel encoders or localization feedback. `DONE` and
+`TILE_DONE` confirm that the scheduled motor timings elapsed and outputs were
+stopped; the coordinates remain open-loop estimates. Battery sag, friction,
+load, startup delay, and motor mismatch can change actual travel. Calibration
+values `DRIVE_SPEED_MM_S` and `TURN_RATE_DEG_S` in
+`esp32/esp32_robot_control.py` deliberately start as `None`, so path-ready
+preflight fails closed until measured on the assembled robot at the selected
+`PATH_DUTY_U16`. Do not put guessed values there or interpret protocol
+completion as physical arrival.
 
 ### Robot ESP32 radio and motor jog test
 
@@ -156,7 +202,9 @@ MOTOR_TEST|test_id|direction_a|direction_b|duty_u16|duration_ms
 MOTOR_STOP|test_id
 ```
 
-The robot answers `RADIO_PING` with `RADIO_PONG|token`.
+The robot answers `RADIO_PING` with `RADIO_PONG|token|path_status|pose_status|x|y|heading`.
+`path_status` is `PATH_READY` or `PATH_NOT_CONFIGURED`; `pose_status` is
+`POSE_VALID` or `POSE_UNKNOWN`.
 The panel offers forward, reverse, pivot-left/right, and Motor A/B-only jogs.
 Choose duty from 1--75 percent and duration from 100--1500 ms. The default is
 30 percent for 400 ms. The robot acknowledges start and reports when the timer
@@ -229,10 +277,11 @@ request/reply. This checks the computer-to-board serial link without requiring
 the robot. `RX|mac|message` lines are forwarded from the robot and shown in the
 control window log.
 
-The robot replies to path segments using this completion format:
+The robot reports scheduled segment and tile completion separately:
 
 ```text
-DONE|H0001|0
+DONE|H0001|0|0.7500|0.5000|0.00
+TILE_DONE|H0001|0|0|18
 ```
 
 Keep each ESP-NOW message at or below 240 encoded bytes. Send one short task or
@@ -242,8 +291,9 @@ waypoint at a time rather than a full detailed path. The bridge prints
 `RX|sender_mac|robot_message` for each robot message. It prints `ERROR|reason`
 for an oversized or otherwise invalid serial command.
 
-The bridge does not retry commands. The desktop checks mission and sequence
-IDs and updates the map after all planned segments report `DONE`.
+The bridge does not retry commands. The desktop checks mission IDs, tile
+coordinates, segment count, and sequence order. It updates the map only after
+the matching `TILE_DONE`, not after a radio transmit or segment acknowledgement.
 
 ### Testing and validation procedure
 
@@ -258,9 +308,11 @@ From the project folder, run:
 python -m unittest test_serial_protocol.py test_robot_motion.py
 ```
 
-Pass condition: all twelve tests pass. These cover `PING`, `TASK`, `MOVE`, and
-`SEG` formatting, invalid values, `RX` parsing, and differential-drive wheel
-target signs. They do not open a COM port or drive motors.
+Pass condition: all listed test cases pass. These cover `PING`, `TASK`, `MOVE`,
+and `SEG` formatting, invalid values, `RX` parsing, and differential-drive
+geometry calculations. They do not open a COM port or drive motors. The new
+tile-manifest and end-to-end robot completion behavior still need protocol and
+hardware validation below.
 
 #### 2. Check the USB serial round trip
 
@@ -296,22 +348,28 @@ Pass condition: the app log contains the sent `PING|token` and received
 TFT displays the status. This checks the same USB path using the GUI's serial
 reader and port selection.
 
-#### 4. Check command forwarding over ESP-NOW
+#### 4. Validate the robot startup handshake
 
 This check requires the robot ESP32 to be powered, configured on the same
 channel, and running firmware that understands the text protocol.
 
-1. Connect the computer to the main-control ESP32 as above.
-2. Check bridge-to-robot radio communication using the radio ping supported by
-   the robot firmware. A `TX` line confirms only that the main ESP32 sent a
-   packet; a matching robot reply confirms the radio round trip.
-3. Do not treat a planned `SEG` as motor execution. The current robot firmware
-   has no calibrated path-segment timing handler and may reply with `ERR` when
-   legacy motion configuration is missing. Timed planner-path execution is future work.
+1. Connect the computer to the main-control ESP32 and confirm its matching USB
+   PING/PONG.
+2. In the main window select **Robot hardware (ESP-NOW)** and click **Start**.
+   Confirm the app sends a tokenized radio ping and receives a matching robot
+   reply and matching estimated pose before it attempts a tile manifest.
+3. With calibration values unset, expect `PATH_NOT_CONFIGURED`; this confirms
+   radio reachability while preventing an uncalibrated path from starting.
+4. Only after safe physical motor checks, measure straight speed and pivot
+   rate at the configured duty. Enter these values in
+   `esp32/esp32_robot_control.py`, restart the robot, and confirm preflight
+   reports `PATH_READY|POSE_VALID` with a pose matching the desktop. The robot
+   must be physically placed at its configured start before boot; its pose is
+   not measured from hardware.
 
-Pass condition: the matching radio-ping reply is visible on the main board and
-in the desktop log. Planner-path `DONE` semantics are not implemented by the
-manual motor-jog feature.
+Pass condition: the matching token is shown in the desktop log and the app
+reports the robot's path-readiness status separately from simple radio
+connectivity. A bridge `TX` by itself is not a pass.
 
 #### 5. Test motor jog packets
 
@@ -332,11 +390,26 @@ turns the wrong way, set its `MOTOR_A_DIRECTION_INVERTED` or
 `MOTOR_B_DIRECTION_INVERTED` option in `esp32/motor_driver.py` after checking
 each channel separately.
 
-#### 6. Validate path completion behavior
+#### 6. Validate scheduled tile completion behavior
 
-Only after all segments have matching `DONE` replies does the app mark the
-target searched. Robot setup errors, stale mission IDs, and wrong sequence
-numbers must not advance the map.
+1. Use wheels-raised, bounded tests in a clear area. Select Robot hardware mode
+   and observe `MISSION_START`, the matching `MISSION_READY`, then one matching
+   `RECEIVED` and scheduled `DONE` per sequence.
+2. Confirm the robot's final `TILE_DONE|mission|row|column|count` has the same
+   mission ID, active tile, and declared segment count.
+3. Confirm the GUI updates the robot pose only on segment `DONE` and marks the
+   tile searched / chooses the next tile only on matching `TILE_DONE`.
+4. Confirm malformed, stale, or out-of-order replies are ignored. Disconnect
+   radio or stop a test safely and confirm a missing confirmation cannot
+   advance the map. Keep the physical motor-supply disconnect within reach.
+5. Repeat straight and pivot trials and record the actual measured endpoint
+   error. A `TILE_DONE` means the schedule ran; it cannot verify measured
+   arrival because there is no wheel feedback.
+
+Pass condition: the tile state advances exactly once after the matching final
+tile reply, and does not advance on `TX`, `MISSION_READY`, intermediate `DONE`,
+an error, or a timeout. Physical validation separately requires observed
+wheel movement, correct direction, repeatable calibration, and stopping.
 
 #### Troubleshooting
 

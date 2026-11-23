@@ -35,6 +35,7 @@ Tkinter mini-glossary for reading this file:
 
 import math                         # Distance calculation for smooth movement.
 import json                         # Save the planned route as a readable file.
+import uuid                         # Keep mission IDs unique across app restarts.
 import tkinter as tk                # Base windows, Canvas drawing, and events.
 from tkinter import ttk             # Themed labels, buttons, frames, and menus.
 from pathlib import Path             # Build a save-file path beside this script.
@@ -43,6 +44,7 @@ from tkinter import messagebox
 from serial_link import SerialLink, available_ports
 from serial_protocol import (
     make_move_message,
+    make_mission_start_message,
     make_ping_message,
     make_segment_message,
     make_task_message,
@@ -115,7 +117,7 @@ movement_command_vector = []       # Upcoming pivot-and-drive commands for displ
 local_canvas = None                # Enlarged one-square pattern canvas.
 route_status = None                # Completion/obstacle count shown under both views.
 main_after_id = None               # Timer handle, so close can cancel the callback.
-paused = False
+paused = True
 esp32_link = None
 control_window = None
 control_log = None
@@ -134,10 +136,18 @@ fake_mode_button_text = None
 motor_test_status_text = None
 last_serial_port_signature = None
 hardware_mission_counter = 1
+hardware_session_id = uuid.uuid4().hex[:8].upper()
 hardware_mission_id = None
 hardware_path_commands = []
 hardware_path_index = 0
 hardware_waiting_sequence = None
+hardware_waiting_ready = False
+hardware_waiting_tile_done = False
+hardware_preflight_token = None
+hardware_preflight_stage = None
+hardware_radio_ready = False
+usb_link_ready = False
+run_mode = None
 
 
 # -------------------------------- Main window -------------------------------
@@ -195,6 +205,18 @@ ttk.Button(toolbar, text="Save path plan", command=lambda: save_path_plan()).gri
 )
 spill_button = ttk.Button(toolbar, text="Add spill: off", command=lambda: toggle_spill_mode())
 spill_button.grid(row=0, column=9, padx=(8, 0))
+ttk.Label(toolbar, text="Run mode:").grid(row=0, column=10, padx=(12, 4))
+run_mode_choice = tk.StringVar(value="Select mode")
+run_mode_menu = ttk.Combobox(
+    toolbar, textvariable=run_mode_choice,
+    values=("Simulation", "Robot hardware (ESP-NOW)"),
+    state="readonly", width=23,
+)
+run_mode_menu.grid(row=0, column=11, padx=(0, 6))
+run_mode_button = ttk.Button(
+    toolbar, text="Start", command=lambda: start_selected_mode()
+)
+run_mode_button.grid(row=0, column=12)
 
 # Put both visualizations next to each other in one frame/window.
 view_frame = ttk.Frame(window, padding=(10, 0, 10, 0))
@@ -352,6 +374,21 @@ def current_destination():
 def update_command_readout():
     """Explain the next movement in plain language beside the path display."""
     global movement_command_vector
+    if hardware_mission_id is not None:
+        if hardware_waiting_tile_done:
+            command_text.set("Final segment confirmed; waiting for robot TILE_DONE.")
+        elif hardware_waiting_ready:
+            command_text.set("Tile path declared; waiting for robot MISSION_READY.")
+        else:
+            command_text.set(
+                "Robot-confirmed segment %d/%d; awaiting the next completion token."
+                % (hardware_path_index, len(hardware_path_commands))
+            )
+        movement_vector_text.set(
+            "Confirmed scheduled segments: %d/%d; tile state waits for TILE_DONE."
+            % (hardware_path_index, len(hardware_path_commands))
+        )
+        return
     if leak_stop_latched:
         command_text.set(
             "LEAK DETECTED: robot stopped at its current pose. Acknowledge to resume."
@@ -1045,6 +1082,9 @@ def toggle_obstacle_at(x, y):
     the row and column under the click. The bounds check ignores clicks outside
     the grid. SearchGrid protects completed squares and the current target.
     """
+    if hardware_mission_id is not None:
+        status_text.set("The robot is executing its declared tile path; pause or stop before editing the map.")
+        return
     # // is floor division: 115 // 48 is 2, meaning pixel 115 is in cell 2.
     # int() turns that result into an integer index. The comma assignment
     # unpacks the two results into row and column variables.
@@ -1117,6 +1157,10 @@ def change_pattern(*_):
     is still traveling between squares, update the upcoming square's pattern.
     """
     global path_points, path_index, active_pattern
+    if hardware_mission_id is not None:
+        pattern_choice.set(active_pattern)
+        status_text.set("The active robot tile pattern is fixed until its mission ends.")
+        return
     if grid.target_cell is not None and travel_points:
         # The robot has not started this square yet, so replace its pending path.
         active_pattern = pattern_choice.get()
@@ -1149,6 +1193,9 @@ def update_search():
     # path_index and main_after_id are reassigned by this callback; global
     # updates the shared app state declared at the top of this file.
     global path_index, main_after_id
+    if run_mode != "simulation":
+        main_after_id = window.after(FRAME_MS, update_search)
+        return
     # Check before any movement in this frame. Once inside the demo detection
     # radius, the simulation latches a stop and waits for operator acknowledgment.
     if check_simulated_leak_detection():
@@ -1200,7 +1247,12 @@ def toggle_pause():
     """Pause or resume motion without closing the application window."""
     global paused, leak_stop_latched
     if hardware_mission_id is not None:
-        serial_status_text.set("Robot path is active; wait for robot DONE before resuming")
+        stop_hardware_mission(
+            "Operator stopped the robot path; verify the robot stopped physically"
+        )
+        return
+    if run_mode != "simulation":
+        serial_status_text.set("Select Simulation and click Start to animate the map")
         return
     if leak_stop_latched:
         # A leak stop is intentionally latched; the operator must acknowledge
@@ -1230,6 +1282,11 @@ def reset_search():
     if hardware_mission_id is not None:
         serial_status_text.set("Wait for or stop the active hardware path before resetting")
         return
+    if run_mode == "hardware" and hardware_radio_ready:
+        serial_status_text.set(
+            "Hardware pose cannot be reset in software. Reposition and reboot the robot, then restart the app."
+        )
+        return
     grid.reset()
     # SearchGrid.reset() clears all obstacles, so restore the standard rack
     # layout immediately afterward. Manually toggled obstacles are reset away.
@@ -1249,10 +1306,10 @@ def reset_search():
     spill_selection_cell = None
     leak_stop_latched = False
     spill_button.configure(text="Add spill: off")
-    paused = False
+    paused = True
     # Restore the button's original label after resetting the simulation.
     pause_button.configure(text="Pause")
-    status_text.set("Restarting from row 1, column 1…")
+    status_text.set("Reset complete. Click Start to run the selected mode.")
     choose_next_target()
     redraw()
 
@@ -1317,10 +1374,14 @@ def monitor_serial_port_changes():
 
 def toggle_serial_connection():
     """Connect to or disconnect from the selected USB serial port."""
-    global esp32_link
+    global esp32_link, usb_link_ready, hardware_radio_ready
     if esp32_link is not None:
+        if hardware_mission_id is not None:
+            stop_hardware_mission("USB disconnected; robot mission stopped")
         esp32_link.close()
         esp32_link = None
+        usb_link_ready = False
+        hardware_radio_ready = False
         pending_ping_tokens.clear()
         serial_connect_button.configure(text="Connect + identify")
         serial_status_text.set("Disconnected")
@@ -1335,6 +1396,8 @@ def toggle_serial_connection():
         return
     try:
         esp32_link = SerialLink(port)
+        usb_link_ready = False
+        hardware_radio_ready = False
         serial_connect_button.configure(text="Disconnect")
         serial_status_text.set("Connected to %s; waiting for board…" % port)
         append_serial_log("Opening %s" % port)
@@ -1355,6 +1418,114 @@ def send_connection_ping():
     message = make_ping_message(token)
     if send_esp32_line(message):
         serial_status_text.set("Connected; checking USB communication…")
+
+        def usb_ping_timeout():
+            if token in pending_ping_tokens:
+                pending_ping_tokens.discard(token)
+                serial_status_text.set("No matching USB PONG; check the selected port and bridge firmware")
+                if hardware_preflight_stage == "usb":
+                    run_mode_button.configure(text="Retry link check", state="normal")
+
+        window.after(3000, usb_ping_timeout)
+
+
+def start_selected_mode():
+    """Start simulation, or validate both communication hops before hardware."""
+    global run_mode, paused, hardware_preflight_stage, hardware_preflight_token
+    global next_robot_ping_id, hardware_radio_ready
+    selected = run_mode_choice.get()
+    if hardware_mission_id is not None:
+        serial_status_text.set("Wait for the active robot tile to finish before changing modes")
+        return
+    requested_mode = "simulation" if selected == "Simulation" else (
+        "hardware" if selected == "Robot hardware (ESP-NOW)" else None
+    )
+    if (run_mode is not None and requested_mode != run_mode
+            and (grid.order or abs(robot_row - 0.5) > 1e-6
+                 or abs(robot_column - 0.5) > 1e-6)):
+        serial_status_text.set(
+            "Reset the map and return the robot to its known start pose before changing run modes"
+        )
+        return
+    if selected == "Simulation":
+        if hardware_preflight_token is not None:
+            pending_robot_ping_tokens.discard(hardware_preflight_token)
+        hardware_preflight_token = None
+        hardware_preflight_stage = None
+        hardware_radio_ready = False
+        run_mode = "simulation"
+        paused = False
+        pause_button.configure(text="Pause", state="normal")
+        run_mode_button.configure(text="Simulation running")
+        status_text.set("SIMULATION MODE: map motion is generated on this computer.")
+        serial_status_text.set("Simulation active; no robot movement is being commanded")
+        redraw()
+        return
+    if selected != "Robot hardware (ESP-NOW)":
+        status_text.set("Choose Simulation or Robot hardware, then click Start.")
+        return
+    if fake_robot_mode:
+        serial_status_text.set("Turn off local fake-robot motor mode before robot-path operation")
+        return
+    run_mode = "hardware"
+    paused = True
+    hardware_radio_ready = False
+    pause_button.configure(text="Robot controlled", state="disabled")
+    run_mode_button.configure(text="Checking links…", state="disabled")
+    if esp32_link is None:
+        hardware_preflight_stage = "usb"
+        run_mode_button.configure(text="Connect ESP32 first", state="normal")
+        serial_status_text.set("Robot mode selected. Connect and identify the main-control ESP32.")
+        return
+    if not usb_link_ready:
+        hardware_preflight_stage = "usb"
+        run_mode_button.configure(text="Waiting for USB PONG…", state="normal")
+        serial_status_text.set("Robot mode selected. Waiting for matching USB PING/PONG.")
+        if not pending_ping_tokens:
+            send_connection_ping()
+        return
+    if active_motor_test_token is not None:
+        hardware_preflight_stage = None
+        run_mode_button.configure(text="Wait for motor jog", state="normal")
+        serial_status_text.set("Wait for or stop the current motor jog before starting a tile path")
+        return
+    if hardware_preflight_stage == "radio" and hardware_preflight_token is not None:
+        serial_status_text.set("Waiting for the robot radio validation already in progress")
+        return
+    request_robot_path_preflight()
+
+
+def request_robot_path_preflight():
+    """Ping the robot through the bridge before allowing a hardware mission."""
+    global next_robot_ping_id, hardware_preflight_stage, hardware_preflight_token
+    if esp32_link is None or not usb_link_ready:
+        serial_status_text.set("USB board identification is required before robot radio check")
+        return
+    token = "RUN%04d" % next_robot_ping_id
+    next_robot_ping_id += 1
+    hardware_preflight_token = token
+    hardware_preflight_stage = "radio"
+    pending_robot_ping_tokens.add(token)
+    if not send_esp32_line(make_robot_radio_ping_message(token)):
+        pending_robot_ping_tokens.discard(token)
+        hardware_preflight_stage = None
+        run_mode_button.configure(text="Start robot mode", state="normal")
+        return
+    run_mode_button.configure(text="Checking robot radio…", state="disabled")
+    serial_status_text.set("USB link passed; waiting for the robot ESP32 radio reply.")
+
+    def radio_preflight_timeout():
+        global hardware_preflight_stage, hardware_preflight_token
+        if hardware_preflight_token == token and token in pending_robot_ping_tokens:
+            pending_robot_ping_tokens.discard(token)
+            hardware_preflight_token = None
+            hardware_preflight_stage = None
+            run_mode_button.configure(text="Start robot mode", state="normal")
+            serial_status_text.set(
+                "Robot radio check timed out. Check robot power, channel, firmware, and MAC."
+            )
+
+    window.after(2500, radio_preflight_timeout)
 
 
 def append_serial_log(message):
@@ -1389,21 +1560,28 @@ def send_esp32_line(message):
 def stop_hardware_mission(message):
     """Clear the queued path after the robot reports an execution error."""
     global hardware_mission_id, hardware_path_commands, hardware_waiting_sequence
+    global hardware_waiting_ready, hardware_waiting_tile_done
+    if hardware_mission_id is not None and esp32_link is not None:
+        send_esp32_line("MISSION_STOP|%s" % hardware_mission_id)
     hardware_mission_id = None
     hardware_path_commands = []
     hardware_waiting_sequence = None
-    pause_button.configure(text="Resume", state="normal")
+    hardware_waiting_ready = False
+    hardware_waiting_tile_done = False
+    pause_button.configure(text="Robot controlled", state="disabled")
+    run_mode_button.configure(text="Retry robot mode", state="normal")
     serial_status_text.set(message)
     append_serial_log(message)
 
 
 def send_next_hardware_segment():
     """Send one planned segment and wait for its matching robot DONE reply."""
-    global hardware_waiting_sequence
+    global hardware_waiting_sequence, hardware_waiting_tile_done
     if hardware_mission_id is None:
         return
     if hardware_path_index >= len(hardware_path_commands):
-        finish_hardware_mission()
+        hardware_waiting_tile_done = True
+        serial_status_text.set("Segments are finished; waiting for robot TILE_DONE")
         return
     command = hardware_path_commands[hardware_path_index]
     try:
@@ -1420,13 +1598,25 @@ def send_next_hardware_segment():
                 hardware_path_index + 1, len(hardware_path_commands)
             )
         )
+        mission_id = hardware_mission_id
+        sequence = hardware_waiting_sequence
+
+        def segment_timeout():
+            if (hardware_mission_id == mission_id
+                    and hardware_waiting_sequence == sequence):
+                stop_hardware_mission(
+                    "No matching robot DONE for segment %d; mission stopped." % sequence
+                )
+
+        window.after(20000, segment_timeout)
     else:
         stop_hardware_mission("Could not send path segment")
 
 
 def finish_hardware_mission():
-    """Mark the active target searched after every planned segment returns DONE."""
+    """Advance the tile only after the robot confirms the declared path finished."""
     global hardware_mission_id, hardware_path_commands, hardware_waiting_sequence, paused
+    global hardware_waiting_ready, hardware_waiting_tile_done
     finished_cell = grid.target_cell
     if finished_cell is not None:
         completed_path_records.append(
@@ -1437,17 +1627,26 @@ def finish_hardware_mission():
     hardware_mission_id = None
     hardware_path_commands = []
     hardware_waiting_sequence = None
+    hardware_waiting_ready = False
+    hardware_waiting_tile_done = False
     paused = True
-    pause_button.configure(text="Resume", state="normal")
-    serial_status_text.set("Robot completed the planned square; next path is ready")
-    append_serial_log("Hardware mission completed all segments")
+    pause_button.configure(text="Robot controlled", state="disabled")
+    run_mode_button.configure(text="Robot running", state="disabled")
+    serial_status_text.set("Robot confirmed the tile path; map advanced to the next tile")
+    append_serial_log("Robot TILE_DONE confirmation accepted; marked tile searched")
     redraw()
+    if run_mode == "hardware" and not grid.complete:
+        window.after(400, start_hardware_path)
+    elif grid.complete:
+        run_mode_button.configure(text="Robot path complete", state="disabled")
 
 
 def handle_robot_radio_event(line):
     """Process a robot reply relayed by the main-control ESP32."""
     global hardware_path_index, robot_row, robot_column, robot_heading
     global active_motor_test_token
+    global hardware_radio_ready, hardware_preflight_stage, hardware_preflight_token
+    global hardware_waiting_ready, hardware_waiting_tile_done
     fields = line.split("|", 2)
     if len(fields) < 3 or fields[0] != "RX":
         return
@@ -1458,7 +1657,46 @@ def handle_robot_radio_event(line):
         token = robot_fields[1]
         if token in pending_robot_ping_tokens:
             pending_robot_ping_tokens.discard(token)
-            message = "Robot ESP32 radio ping passed (%s)." % token
+            path_status = robot_fields[2] if len(robot_fields) >= 3 else "PATH_STATUS_UNKNOWN"
+            pose_status = robot_fields[3] if len(robot_fields) >= 4 else "POSE_STATUS_UNKNOWN"
+            message = "Robot ESP32 radio ping passed (%s; %s; %s)." % (
+                token, path_status, pose_status
+            )
+            if token == hardware_preflight_token:
+                hardware_preflight_stage = None
+                hardware_preflight_token = None
+                pose_matches = False
+                if path_status == "PATH_READY" and pose_status == "POSE_VALID" and len(robot_fields) >= 7:
+                    try:
+                        remote_x = float(robot_fields[4])
+                        remote_y = float(robot_fields[5])
+                        remote_heading = float(robot_fields[6])
+                        heading_error = (
+                            remote_heading - math.degrees(robot_heading) + 180
+                        ) % 360 - 180
+                        pose_matches = (
+                            all(math.isfinite(value) for value in (remote_x, remote_y, remote_heading))
+                            and abs(remote_x - robot_column) <= 0.02
+                            and abs(remote_y - robot_row) <= 0.02
+                            and abs(heading_error) <= 0.5
+                        )
+                    except ValueError:
+                        pose_matches = False
+                hardware_radio_ready = path_status == "PATH_READY" and pose_matches
+                if hardware_radio_ready:
+                    run_mode_button.configure(text="Robot connected; starting tile…", state="disabled")
+                    serial_status_text.set(message + " Starting the first tile mission.")
+                    start_hardware_path()
+                elif path_status == "PATH_READY" and not pose_matches:
+                    run_mode_button.configure(text="Robot pose not synchronized", state="normal")
+                    serial_status_text.set(
+                        message + " Place the robot at its configured start, reboot it, reset the app map, and reconnect."
+                    )
+                else:
+                    run_mode_button.configure(text="Robot path unavailable", state="normal")
+                    serial_status_text.set(
+                        message + " Configure calibrated drive speed, turn rate, and motor driver first."
+                    )
             if motor_test_status_text is not None:
                 motor_test_status_text.set(message)
             append_serial_log(message)
@@ -1502,11 +1740,45 @@ def handle_robot_radio_event(line):
         if mission == hardware_mission_id and sequence == str(hardware_waiting_sequence):
             serial_status_text.set("Robot accepted segment %s; executing" % sequence)
         return
+    if kind == "MISSION_READY" and len(robot_fields) >= 3:
+        mission, count_text = robot_fields[1], robot_fields[2]
+        if mission == hardware_mission_id and hardware_waiting_ready:
+            try:
+                accepted_count = int(count_text)
+            except ValueError:
+                stop_hardware_mission("Robot returned an invalid MISSION_READY count")
+                return
+            if accepted_count != len(hardware_path_commands):
+                stop_hardware_mission("Robot accepted a different tile segment count")
+                return
+            hardware_waiting_ready = False
+            hardware_waiting_tile_done = False
+            append_serial_log("Robot accepted complete tile manifest (%s segments)" % accepted_count)
+            send_next_hardware_segment()
+        return
+    if kind == "TILE_DONE" and len(robot_fields) >= 5:
+        mission = robot_fields[1]
+        try:
+            row, column, count = map(int, robot_fields[2:5])
+        except ValueError:
+            append_serial_log("Ignored malformed TILE_DONE confirmation")
+            return
+        if (mission != hardware_mission_id or not hardware_waiting_tile_done
+                or hardware_path_index != len(hardware_path_commands)
+                or grid.target_cell != (row, column)
+                or count != len(hardware_path_commands)):
+            append_serial_log("Ignored stale/unmatched TILE_DONE: " + fields[2])
+            return
+        finish_hardware_mission()
+        return
     if kind == "PLAN":
         append_serial_log("Robot wheel plan: " + fields[2])
         return
     if kind == "ERR":
         stop_hardware_mission("Robot rejected command: " + fields[2])
+        return
+    if kind == "MISSION_STOPPED":
+        append_serial_log("Robot confirmed mission stop: " + "|".join(robot_fields[1:]))
         return
     if kind != "DONE" or len(robot_fields) < 3:
         return
@@ -1524,31 +1796,57 @@ def handle_robot_radio_event(line):
         append_serial_log("Ignored stale/unmatched robot DONE: " + fields[2])
         return
 
-    # DONE indicates that the firmware reported completion. Without wheel
-    # feedback, the GUI pose remains only the commanded motion estimate.
+    # DONE confirms the segment schedule ended. Without wheel feedback, this
+    # pose remains an open-loop estimate and TILE_DONE is not physical sensing.
     command = hardware_path_commands[hardware_path_index]
-    robot_column = command["target_x_ft"]
-    robot_row = command["target_y_ft"]
-    robot_heading = math.radians(command["global_heading_degrees"])
+    try:
+        robot_column = float(robot_fields[3]) if len(robot_fields) >= 6 else command["target_x_ft"]
+        robot_row = float(robot_fields[4]) if len(robot_fields) >= 6 else command["target_y_ft"]
+        heading_degrees = float(robot_fields[5]) if len(robot_fields) >= 6 else command["global_heading_degrees"]
+    except ValueError:
+        stop_hardware_mission("Robot returned invalid pose fields with DONE")
+        return
+    if not all(math.isfinite(value) for value in (robot_column, robot_row, heading_degrees)):
+        stop_hardware_mission("Robot returned non-finite pose fields with DONE")
+        return
+    robot_heading = math.radians(heading_degrees)
     hardware_path_index += 1
     hardware_waiting_sequence = None
     if hardware_path_index >= len(hardware_path_commands):
-        finish_hardware_mission()
+        hardware_waiting_tile_done = True
+        serial_status_text.set("All segments acknowledged; waiting for robot TILE_DONE")
+        mission_id = hardware_mission_id
+
+        def tile_done_timeout():
+            if hardware_mission_id == mission_id and hardware_waiting_tile_done:
+                stop_hardware_mission("Robot did not confirm completion of the tile path")
+
+        window.after(5000, tile_done_timeout)
     else:
         redraw()
         send_next_hardware_segment()
 
 
 def start_hardware_path():
-    """Pause the simulator and stream its remaining path one DONE at a time."""
+    """Declare the active tile path, then stream segments after robot READY."""
     global paused
     global hardware_mission_counter, hardware_mission_id
     global hardware_path_commands, hardware_path_index, hardware_waiting_sequence
+    global hardware_waiting_ready, hardware_waiting_tile_done
+    if run_mode != "hardware":
+        serial_status_text.set("Select Robot hardware (ESP-NOW) and complete link checks first")
+        return
     if esp32_link is None:
         serial_status_text.set("Connect to the main-control ESP32 first")
         return
     if active_motor_test_token is not None:
         serial_status_text.set("Wait for or stop the active motor jog before a planned path")
+        return
+    if fake_robot_mode:
+        serial_status_text.set("Turn off fake-robot mode; it directs motor jogs to the control board")
+        return
+    if not hardware_radio_ready:
+        serial_status_text.set("Robot radio validation is required before starting a path")
         return
     if leak_stop_latched:
         serial_status_text.set("Acknowledge the leak stop before sending a path")
@@ -1562,25 +1860,47 @@ def start_hardware_path():
         serial_status_text.set("There is no planned movement path to send")
         return
 
-    hardware_mission_id = "H%04d" % hardware_mission_counter
+    hardware_mission_id = "H%s%04d" % (hardware_session_id, hardware_mission_counter)
     hardware_mission_counter += 1
     hardware_path_commands = [dict(command) for command in movement_command_vector]
     hardware_path_index = 0
     hardware_waiting_sequence = None
+    hardware_waiting_ready = True
+    hardware_waiting_tile_done = False
     paused = True
-    pause_button.configure(text="Robot busy", state="disabled")
+    pause_button.configure(text="STOP robot path", state="normal")
+    run_mode_button.configure(text="Robot executing", state="disabled")
     redraw()
     append_serial_log(
         "Starting %s with %d segments" % (
             hardware_mission_id, len(hardware_path_commands)
         )
     )
-    send_next_hardware_segment()
+    target_row, target_column = grid.target_cell
+    try:
+        manifest = make_mission_start_message(
+            hardware_mission_id, target_row, target_column, active_pattern,
+            len(hardware_path_commands),
+        )
+    except Exception as error:
+        stop_hardware_mission("Could not declare tile path: %s" % error)
+        return
+    if not send_esp32_line(manifest):
+        stop_hardware_mission("Could not send tile mission manifest")
+        return
+    mission_id = hardware_mission_id
+
+    def ready_timeout():
+        if hardware_mission_id == mission_id and hardware_waiting_ready:
+            stop_hardware_mission("Robot did not accept the tile mission manifest")
+
+    window.after(5000, ready_timeout)
 
 
 def poll_serial_events():
     """Move background serial-reader events onto Tkinter's UI thread."""
     global fake_robot_mode, fake_robot_mode_pending
+    global usb_link_ready, hardware_preflight_stage, hardware_radio_ready
     if esp32_link is not None:
         while True:
             try:
@@ -1591,6 +1911,8 @@ def poll_serial_events():
             if line.startswith("READY|"):
                 fake_robot_mode = False
                 fake_robot_mode_pending = None
+                usb_link_ready = False
+                hardware_radio_ready = False
                 if fake_mode_button_text is not None:
                     fake_mode_button_text.set("Enable fake robot mode")
                 serial_status_text.set("Connected to %s; board ready" % esp32_link.port)
@@ -1598,7 +1920,10 @@ def poll_serial_events():
                 token = line.split("|", 1)[1]
                 if token in pending_ping_tokens:
                     pending_ping_tokens.discard(token)
+                    usb_link_ready = True
                     serial_status_text.set("ESP32 identified; USB ping passed")
+                    if hardware_preflight_stage == "usb":
+                        request_robot_path_preflight()
                 else:
                     serial_status_text.set("Unexpected PONG token: %s" % token)
             elif line.startswith("MODE|FAKE_ROBOT|"):
@@ -1791,6 +2116,9 @@ def open_robot_control():
 
     def toggle_fake_robot_mode():
         global fake_robot_mode_pending
+        if hardware_mission_id is not None or run_mode == "hardware":
+            motor_test_status_text.set("Leave Robot hardware mode before changing the local motor-test mode.")
+            return
         if esp32_link is None:
             motor_test_status_text.set("Connect to the main-control ESP32 first.")
             return
@@ -1960,7 +2288,7 @@ def open_robot_control():
     ).grid(row=2, column=0, pady=(6, 0), sticky="w")
     ttk.Button(
         test_frame,
-        text="Send planned path (wait for each robot DONE)",
+        text="Send active tile path (Robot hardware mode)",
         command=lambda: start_hardware_path(),
     ).grid(row=3, column=0, pady=(8, 0), sticky="w")
 
@@ -1998,6 +2326,8 @@ def close_main_window():
         # after_cancel(id) removes a callback that was queued with window.after().
         window.after_cancel(main_after_id)
     if esp32_link is not None:
+        if hardware_mission_id is not None:
+            send_esp32_line("MISSION_STOP|%s" % hardware_mission_id)
         if active_motor_test_token is not None:
             send_esp32_line(make_motor_stop_message(active_motor_test_token))
         esp32_link.close()
@@ -2010,6 +2340,7 @@ window.protocol("WM_DELETE_WINDOW", close_main_window)
 refresh_serial_ports()
 window.after(2000, monitor_serial_port_changes)
 choose_next_target()
+status_text.set("Choose Simulation or Robot hardware, then click Start. Motion is paused.")
 redraw()
 # after(ms, callback) queues the first animation frame 25 ms from now.
 main_after_id = window.after(FRAME_MS, update_search)

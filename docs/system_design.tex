@@ -68,8 +68,8 @@ Within-tile coverage & Student-led footprint and coverage intent; AI-assisted wa
 Desktop GUI and mission coordination & Student-directed workflow and requested features; AI-assisted implementation and debugging & Implemented in \texttt{main.py}; visualization and simulation are software behavior.\\
 USB serial protocol & Student selected PySerial and line-oriented packet approach; AI-assisted formatting, connection, and debugging & Implemented in \texttt{serial\_link.py} and \texttt{serial\_protocol.py}; operation depends on the correct board, port, and firmware.\\
 ESP32 radio bridge and display & Student-directed ESP-NOW link and status-display requirements; AI-assisted firmware and integration & Firmware is present; board/channel/MAC setup and hardware checks are required.\\
-Robot segment and motion timing & Student-directed motion interface and open-loop motor-control concept & Geometric segment parsing is present; timed planner-path execution is planned but not implemented.\\
-Motor control, localization, leak sensing & Student-led open-loop PWM and timed-motion concept; AI-assisted implementation and documentation & Bounded manual jogs are implemented on the robot ESP32 and as an optional local main-control-board test mode. Hardware validation is still required; calibrated path execution, localization, and leak sensing remain future work.\\
+Robot segment and motion timing & Student-directed motion interface and open-loop motor-control concept & Tile manifests, sequenced segments, bounded calibrated timing, and matching tile-completion protocol are implemented; physical calibration and validation remain required.\\
+Motor control, localization, leak sensing & Student-led open-loop PWM and timed-motion concept; AI-assisted implementation and documentation & Bounded manual jogs and timed path execution are implemented in source. Hardware calibration, localization, and leak sensing remain future work.\\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -82,7 +82,7 @@ The Data Center Leak Assessment Robot (DCLAR) is a software prototype for planni
 
 The desktop application is mainly a planning and visualization tool. It shows the route, animates the planned movement, allows spill locations to be annotated, and saves a JSON snapshot. It also connects over USB to a main-control ESP32. That board normally bridges messages to a second ESP32 over ESP-NOW, but it can enter an explicitly selected fake-robot mode and drive a motor driver connected to its own GPIO pins for short bench jogs. In either mode, the desktop sends commands; the ESP32 firmware generates the motor outputs. The system does not currently include a physical leak sensor or validated autonomous motion.
 
-The main design idea is to keep the problem separated into smaller pieces. The route planner decides which tile to visit. The coverage planner decides where the robot should move inside that tile. The motion representation converts points into a sequence of turns and straight drives. The communication layer sends one segment at a time to the robot hardware.
+The main design idea is to keep the problem separated into smaller pieces. The route planner decides which tile to visit. The coverage planner decides where the robot should move inside that tile. The motion representation converts points into a sequence of turns and straight drives. In hardware mode, the desktop declares the expected tile path and sends one segment at a time; the GUI waits for the robot's matching tile-completion reply before marking the square searched.
 
 \subsection{System-Level Architecture}
 
@@ -120,7 +120,7 @@ $\downarrow$ \small{ESP-NOW wireless messages over a shared Wi-Fi channel}
 \vspace{5pt}
 \end{minipage}
 }
-\caption{DCLAR software and hardware communication architecture. Motor-jog messages use the ESP-NOW route by default and can be handled locally in fake-robot mode. Both jog paths are bounded and open loop; calibrated planner-path execution is not implemented.}
+\caption{DCLAR software and hardware communication architecture. Run mode is explicitly selected: computer-only simulation or robot hardware. Hardware missions use a tile manifest, sequential segments, and a final robot tile-completion reply. Fake-robot mode is a separate local motor-jog bench feature.}
 \end{figure}
 
 \section{Subsystem Breakdown}
@@ -136,8 +136,8 @@ Tile coverage & \texttt{search.py} & Generates ordered zigzag or circle-spiral w
 USB communication & \texttt{serial\_link.py}, \texttt{serial\_protocol.py} & Finds serial ports, opens the desktop-to-ESP32 connection, and formats messages.\\
 Motor-test protocol & \texttt{esp32/motor\_test\_protocol.py} & Defines bounded motor-test and stop messages shared by the desktop and both firmware targets.\\
 Radio bridge and local mode & \texttt{esp32/esp32\_main\_control.py} & Receives USB serial lines, forwards commands over ESP-NOW in normal mode, and locally handles bounded motor jogs in fake-robot mode.\\
-Robot receiver & \texttt{esp32/esp32\_robot\_control.py} & Receives radio messages and executes bounded motor-jog packets; planner path execution remains a placeholder.\\
-Motion conversion & \texttt{esp32/robot\_motion.py} & Contains an earlier wheel-target placeholder; calibrated timed path conversion is future work.\\
+Robot receiver & \texttt{esp32/esp32\_robot\_control.py} & Validates tile manifests, schedules bounded pivot/drive timing, and reports segment and tile completion.\\
+Motion conversion & \texttt{esp32/robot\_motion.py} & Provides differential-drive geometry helpers for offline calculations; the current firmware path uses measured open-loop speed and turn-rate values.\\
 Robot-board motor output & \texttt{esp32/motor\_driver.py} & Sets direction and capped PWM for radio-requested manual jogs using the robot board's configured GPIO mapping.\\
 Main-control local motor output & \texttt{esp32/main\_control\_motor\_driver.py} & Provides a separate Feather ESP32-S3 pin mapping for direct local jogs; it is loaded only after fake mode is requested.\\
 \bottomrule
@@ -291,25 +291,63 @@ A nominal $9\,\mathrm{V}$ battery is only suitable if its output can support the
 
 The intended robot design has no wheel-motion sensors. After a timed command, the controller can know only that it issued the command for the scheduled duration; it cannot confirm the robot's actual position, detect a stalled wheel, or correct a turn that came up short. Wheel slip, startup delay, battery sag, friction, and small motor differences cause accumulated position error. The map's robot position is therefore a commanded estimate, not a measured pose. The GUI's simulated proximity and leak behavior are not physical sensing.
 
-The current repository still contains an earlier geometry-to-wheel-target placeholder in \texttt{esp32/robot\_motion.py}. It does not implement timed execution of planner paths. A separate bounded \texttt{MOTOR\_TEST} command does set direction and PWM through \texttt{esp32/motor\_driver.py} for a short duration. Any completion message means only that the jog timer elapsed, not that the robot physically reached a target or that the motors were observed to move.
+The computer-generated path has a tile transaction protocol. The desktop chooses the next tile and the zigzag or circle-spiral coverage pattern, then converts each waypoint into a pivot-and-drive segment in global feet and degrees. The robot has a bounded scheduled-time executor for those segments, but its drive speed and turn-rate calibration start unset. The current robot firmware therefore refuses path-ready status until those measured values and a usable motor driver are configured. A separate bounded \texttt{MOTOR\_TEST} command remains available for individual motor jogs. A segment or tile completion reply confirms only that the firmware's schedule ran and stopped; it does not establish actual wheel motion or location.
 
 \section{Hardware Communication and Execution}
 
 The desktop connects to the main-control ESP32 over USB serial. In normal mode, the main-control board forwards movement and motor-test messages to the robot ESP32 over ESP-NOW; both boards must use the same Wi-Fi channel, and the main-control board must be configured with the robot's MAC address. For a basic bench test, the desktop can instead request fake-robot mode. The main-control board then handles motor-test messages locally and uses its own motor-driver GPIOs, so a second robot ESP32 and radio reply are not required for those jogs. Other messages continue through the bridge; fake mode changes the destination of the manual motor-test commands, not the board's entire communication role.
+
+\subsection{Explicit Run Mode and Startup Validation}
+
+The desktop starts with motion paused and requires an explicit run-mode selection. \textbf{Simulation} animates the map on the computer; it does not send a movement path to either ESP32. \textbf{Robot hardware (ESP-NOW)} disables that animation and leaves the map's tile-completion state unchanged until the robot returns a matching completion confirmation. The application also has a separate \textbf{fake-robot motor-jog mode}: despite its name, that mode drives real GPIO outputs on the main-control Feather for short bench tests. It is not the computer-only simulation and it is not the robot-path mode.
+
+Robot hardware startup validates both communication hops before starting a tile:
+\begin{enumerate}
+    \item The desktop opens the selected USB serial port and sends \texttt{PING|token}. The main-control ESP32 must return the same token as \texttt{PONG|token}. A matching response identifies the USB-to-bridge link.
+    \item The desktop sends \texttt{RADIO\_PING|token} through the bridge. The robot returns \texttt{RADIO\_PONG|token|PATH\_READY|POSE\_VALID|x|y|heading} only when its path driver and timing calibration are configured and its commanded pose is valid. It reports \texttt{PATH\_NOT\_CONFIGURED} or \texttt{POSE\_UNKNOWN} when the corresponding condition fails. The desktop compares the reported estimated pose with its map pose before starting.
+    \item Only after both checks pass does the desktop declare the first tile mission. The robot checks the declared segment count, its calibration values, motor-driver interface, and that no conflicting jog or mission is active before replying \texttt{MISSION\_READY}.
+\end{enumerate}
+
+The startup sequence prevents an automatic simulated dot from being mistaken for a robot pose. It also makes USB identity, radio reachability, path-execution readiness, and estimated-pose agreement separate observable states. The robot's boot pose is a configured assumption, not a sensor reading: place it at the configured start pose before booting. A robot-side motor jog or an interrupted timed segment invalidates the estimate; the operator must return the robot to its known start, reboot it, and reset the desktop map before trying again. A missing or stale token does not satisfy a check. Hardware mode has a response timeout; a missing segment or tile confirmation stops the software mission and sends \texttt{MISSION\_STOP}. This wireless stop is useful for controlled bench work, but it is not an emergency disconnect.
+
+\subsection{Tile Mission Transaction and Message Format}
+
+The desktop plans the obstacle-avoiding route and the selected in-tile coverage pattern. The robot does not independently choose a search pattern: the desktop sends the planned waypoint records. To make the robot aware of the complete tile transaction while keeping each radio packet short, the desktop first sends a manifest and then streams one segment at a time:
+\begin{lstlisting}
+MISSION_START|mission_id|tile_row|tile_column|pattern|segment_count
+SEG|mission_id|sequence|pivot_degrees|distance_ft|target_x_ft|target_y_ft|heading_degrees
+\end{lstlisting}
+Rows and columns are zero-based. A manifest such as \texttt{MISSION\_START|H0001|0|0|Zigzag|18} identifies the tile and declares that 18 ordered segments make up its route-plus-coverage path. Each \texttt{SEG} record is sent only after the previous segment's matching completion reply; its sequence begins at zero. The ESP-NOW bridge forwards these lines unchanged and does not decide whether a segment or tile is complete.
+
+The normal response sequence is:
+\begin{lstlisting}
+MISSION_READY|mission_id|segment_count
+RECEIVED|mission_id|sequence
+DONE|mission_id|sequence|estimated_x_ft|estimated_y_ft|estimated_heading_degrees
+... one RECEIVED/DONE pair for each segment ...
+TILE_DONE|mission_id|tile_row|tile_column|segment_count
+\end{lstlisting}
+\texttt{MISSION\_READY} means the robot accepted the manifest and is ready for sequence zero. \texttt{RECEIVED} means that a well-formed segment was accepted. \texttt{DONE} means the calibrated pivot/drive time schedule for that segment elapsed and the motor outputs were stopped. After the last declared sequence, the robot checks that the commanded endpoint matches the declared tile center, then reports \texttt{TILE\_DONE}. The desktop checks the mission ID, target tile, path length, sequence order, and that all segment confirmations arrived before it records the tile as searched and chooses the next tile. It then starts a new tile transaction; the robot does not silently begin a path that was never sent.
+
+An invalid manifest or segment returns \texttt{ERR|mission\_id|sequence|reason}. The desktop ignores unmatched or stale mission IDs and sequence numbers. The operator can stop a running mission with \texttt{MISSION\_STOP|mission\_id}; the robot disables its motor outputs and replies \texttt{MISSION\_STOPPED|mission\_id}. Segment and tile timeouts also stop the queued desktop transaction so a missing reply cannot cause the map to advance.
+
+The word \emph{completed} in \texttt{DONE} and \texttt{TILE\_DONE} has a deliberately narrow meaning: the robot firmware completed the scheduled open-loop motor timing for every declared waypoint. The robot has no wheel encoders or localization feedback, so it cannot detect a stalled motor, wheel slip, a low battery, or a turn that ended short. The reported coordinates are commanded estimates. A tile acknowledgement must therefore never be described as proof that the physical robot reached or searched every point in that tile.
+
+The robot's \texttt{DRIVE\_SPEED\_MM\_S} and \texttt{TURN\_RATE\_DEG\_S} settings in \texttt{esp32/esp32\_robot\_control.py} intentionally start as \texttt{None}. Measure both on the assembled robot at the selected \texttt{PATH\_DUTY\_U16}, with the intended motor supply and load, before setting them. The firmware rejects path startup until both rates and the motor-driver module are valid. Its per-step time and distance limits bound accepted commands; these limits do not make the open-loop estimate accurate. The desktop also rejects a pose mismatch. The robot sends no \texttt{PATH\_READY} status until the driver and calibration can produce a valid scheduled path.
 
 Messages are plain-text lines with fields separated by the pipe character \texttt{|}. The desktop sends one planned path segment at a time using
 \begin{lstlisting}
 SEG|mission_id|sequence|pivot_degrees|distance_ft|target_x_ft|target_y_ft|heading_degrees
 \end{lstlisting}
 
-The bridge forwards the segment. The existing planner-path receiver still uses the earlier wheel-target placeholder and does not execute calibrated timed path motion. It may return \texttt{ERR} because its legacy geometry and motor backend are not supplied. The manual motor-test path is separate:
+The bridge forwards each segment unchanged after forwarding its tile manifest. The robot uses the configured measured drive speed and turn rate to schedule a pivot and then a straight drive at \texttt{PATH\_DUTY\_U16}. This is calibrated timed open-loop motion, not encoder control. The manual motor-test path is separate:
 \begin{lstlisting}
 MOTOR_TEST|test_id|direction_a|direction_b|duty_u16|duration_ms
 MOTOR_STOP|test_id
 \end{lstlisting}
 Direction values are $-1$ (reverse), $0$ (off), and $1$ (forward). Both firmware paths accept a duty value from 1 through 49151 (75 percent of the 16-bit PWM range) and a duration from 100 through 1500 ms. The selected controller replies with \texttt{MOTOR\_TEST\_STARTED}, then \texttt{MOTOR\_TEST\_DONE} when the timer expires, or \texttt{MOTOR\_TEST\_STOPPED} after a stop packet. Invalid or overlapping tests receive \texttt{MOTOR\_TEST\_ERR}. These replies confirm command handling and timer completion; they cannot verify physical motion because there is no wheel feedback.
 
-The reply forms are \texttt{MOTOR\_TEST\_STARTED|test\_id|duration\_ms}, \texttt{MOTOR\_TEST\_DONE|test\_id|elapsed\_ms}, \texttt{MOTOR\_TEST\_STOPPED|test\_id|elapsed\_ms}, and \texttt{MOTOR\_TEST\_ERR|test\_id|reason}. Local replies are wrapped as \texttt{RX|LOCAL|...} so the desktop can distinguish a control-board jog from a robot-radio reply. The robot radio ping uses \texttt{RADIO\_PING|token} and returns \texttt{RADIO\_PONG|token}; it checks the normal radio route only and is not the confirmation for local mode.
+The reply forms are \texttt{MOTOR\_TEST\_STARTED|test\_id|duration\_ms}, \texttt{MOTOR\_TEST\_DONE|test\_id|elapsed\_ms}, \texttt{MOTOR\_TEST\_STOPPED|test\_id|elapsed\_ms}, and \texttt{MOTOR\_TEST\_ERR|test\_id|reason}. Local replies are wrapped as \texttt{RX|LOCAL|...} so the desktop can distinguish a control-board jog from a robot-radio reply. The robot radio ping uses \texttt{RADIO\_PING|token} and returns \texttt{RADIO\_PONG|token|PATH\_READY} or \texttt{RADIO\_PONG|token|PATH\_NOT\_CONFIGURED}; it is separate from the local motor-jog mode.
 
 \subsection{Main-Control Fake-Robot Mode}
 
@@ -321,21 +359,20 @@ The word \emph{fake} describes which firmware acts as the command recipient; it 
 
 For example, \texttt{MOTOR\_TEST|J0001|1|1|19660|400} asks for a 400 ms forward jog on both channels at approximately 30 percent duty. A normal response sequence is \texttt{MOTOR\_TEST\_STARTED|J0001|400}, followed by \texttt{MOTOR\_TEST\_DONE|J0001|elapsed\_ms}. The \texttt{STOP motors} button sends \texttt{MOTOR\_STOP|J0001}; the driver disables PWM outputs, so the chassis may coast rather than brake instantly.
 
-A \texttt{TX} message from the bridge only indicates that the radio send succeeded at the communication layer. It does not mean the robot completed the movement. The desktop advances the mission only after it receives the matching robot-side \texttt{DONE} response. The bridge relays messages but does not own the mission state.
+A \texttt{TX} message from the bridge only indicates that the radio send succeeded at the communication layer. \texttt{MISSION\_READY} confirms manifest acceptance; \texttt{RECEIVED} confirms segment acceptance; \texttt{DONE} confirms that segment's scheduled motor time elapsed; and only a matching \texttt{TILE\_DONE} allows the desktop to mark the tile searched. None of these messages measures physical position. The bridge relays messages but does not own the mission state.
 
 The USB connection can be checked separately using \texttt{PING} and \texttt{PONG}. The GUI uses request tokens such as \texttt{GUI0022} or \texttt{APP0001}; the ESP32 returns the same token. This checks the computer-to-bridge serial connection and does not require the robot to move. The motor-test panel's \textbf{Ping robot radio} sends \texttt{RADIO\_PING|token}; a matching \texttt{RADIO\_PONG|token} confirms a round trip through the configured robot ESP32.
 
 \subsection{Hardware Requirements Before Motion}
 
-The manual panel permits only bounded motor jogs. Calibrated planner-path movement remains unimplemented and requires:
+Planner-path execution uses measured open-loop rates, and still requires physical calibration and validation before use:
 \begin{itemize}
-    \item measured straight-line speed and pivot rate at the selected PWM setting and battery condition;
-    \item a selected maximum PWM duty and maximum motor run time;
-    \item implementation of a path-segment handler that converts planned distances and turns into bounded motor run times;
+    \item measured straight-line speed and pivot rate at the selected PWM setting, supply condition, and intended load;
+    \item a selected maximum PWM duty and maximum per-step motor run time;
     \item verification of battery and driver voltage/current ratings against motor startup/stall current, and of a reliable stop command.
 \end{itemize}
 
-The motor jog driver pinout is documented above, but its exact board wiring must be verified before use. A planner path must not be treated as executable until its timed segment handler is implemented. Completion after a timed command is not proof that the robot reached its target; the reported pose remains an open-loop estimate. The current system also has no physical obstacle-safety model.
+The motor jog driver pinout is documented above, but its exact board wiring must be verified before use. A planner path must not be operated until calibration is measured, one-channel and combined motor tests pass, and bounded scheduled movements are checked on blocks in a clear area. Completion after a timed command is not proof that the robot reached its target; the reported pose remains an open-loop estimate. The current system also has no physical obstacle-safety model.
 
 \section{Spill Annotation and Simulated Stop}
 
@@ -451,7 +488,7 @@ For the main-control board's local mode, use this sequence:
     \item Record the board revision, driver model, GPIO wiring, supply voltage, duty, pulse duration, visible motor response, direction, and any heating or abnormal sound. A reply alone is not a physical test result.
 \end{enumerate}
 
-Then test the separate normal radio path and planner interfaces independently:
+Then test the normal robot radio and tile-completion protocol independently:
 \begin{enumerate}
     \item Run the Python tests for serial protocol formatting and motion-target calculations.
     \item Run the desktop application and check the map, target selection, and local coverage patterns.
@@ -461,11 +498,14 @@ Then test the separate normal radio path and planner interfaces independently:
     \item With both ESP32 boards configured to the same channel, confirm that a robot message is received and relayed as an \texttt{RX} line.
     \item With both boards on the same channel and correct peer MAC configured, use \textbf{Ping robot radio} to confirm the ESP-NOW round trip. This check is intentionally separate from the fake-mode TFT confirmation.
     \item If testing radio motor jogs, use the robot ESP32's GPIO map and the same wheel-raised, one-channel-at-a-time procedure. Do not assume a result on the Feather verifies the second board's wiring.
-    \item Check radio command parsing without connecting the motors; the current firmware is not the timed motor implementation and may return a setup error for motion commands.
-    \item Only conduct floor runs or planner-path operation after calibration and safe bench testing; the manual jog remains a short, open-loop check.
+    \item Select \textbf{Robot hardware (ESP-NOW)} in the main window and click \textbf{Start}. The desktop must first match the USB PONG, then receive the robot's tokenized radio pong. A \texttt{PATH\_NOT\_CONFIGURED} result is an expected fail-closed outcome until measured drive speed, turn rate, and driver setup have been entered in the robot firmware.
+    \item With wheels raised, calibrate the robot's straight speed and pivot rate at its selected duty. Enter those measurements in \texttt{esp32/esp32\_robot\_control.py}, reconnect, and check that the preflight now returns \texttt{PATH\_READY}. Do not use guessed values for a floor run.
+    \item Observe a declared test tile from its \texttt{MISSION\_START} manifest through \texttt{MISSION\_READY}, every ordered \texttt{RECEIVED}/\texttt{DONE} pair, and the final \texttt{TILE\_DONE}. Confirm the GUI does not mark the tile searched on \texttt{TX}, \texttt{MISSION\_READY}, or an intermediate \texttt{DONE}; it advances only for a matching final tile confirmation.
+    \item Verify malformed, stale, out-of-order, or missing replies do not advance the tile. Confirm timeout and operator stop send \texttt{MISSION\_STOP} and physically observe output stopping; keep a hand-operated supply disconnect available.
+    \item Only conduct floor runs after wheel-raised calibration and safe bench testing. Record distance and pivot error over repeated trials; a firmware schedule acknowledgement is not evidence of measured arrival.
 \end{enumerate}
 
-A successful USB PING/PONG, fake-mode confirmation, radio \texttt{TX}, motor timer acknowledgement, or calculated \texttt{PLAN} is evidence about a specific software or communication layer, not proof of physical movement. For this feature, meaningful validation combines the TFT's mode confirmation, correct motor-driver wiring, a bounded response from each individual channel, observed wheel motion, and observed stopping behavior. Record what was actually measured; do not mark hardware validation complete until those checks have been performed on the assembled board and driver.
+A successful USB PING/PONG, fake-mode confirmation, radio pong, \texttt{MISSION\_READY}, segment \texttt{DONE}, or tile \texttt{TILE\_DONE} is evidence about a specific software, communication, or scheduled-execution layer, not proof of physical arrival. For this feature, validation must separately cover the selected desktop run mode, both communication hops, manifest and sequence matching, correctly wired individual motor channels, measured drive and pivot calibration, observed wheel movement, and observed stopping behavior. Record the measured results; do not mark physical search validation complete based on protocol acknowledgements alone.
 
 \section{Current Scope and Next Engineering Steps}
 
@@ -476,8 +516,8 @@ The next engineering steps are:
     \item Calibrate the floor map and add footprint-aware clearance checks around racks.
     \item Measure the sensor field of view and define a real coverage requirement, including overlap and localization error.
     \item Add a localization source for $(x,y,\theta)$ in the global map frame.
-    \item Validate the Feather-local and robot-board motor-driver pin maps on their actual boards, then implement and calibrate bounded timed planner-path motion with an independent physical emergency-stop method.
-    \item Validate pivot and straight-drive performance on the actual floor, including slip and turning error.
+    \item Validate the Feather-local and robot-board motor-driver pin maps on their actual boards, then calibrate the bounded timed planner-path executor and add an independent physical emergency-stop method.
+    \item Add wheel encoders or another localization source so a scheduled completion can be checked against measured motion and corrected for slip and turning error.
     \item Add physical leak-sensor logic and a method for handling false alarms.
     \item Log timestamps, measured pose, sensor readings, commands, and completion status for each segment.
     \item Add mission checkpoint loading if missions need to resume after the application closes.
@@ -485,7 +525,7 @@ The next engineering steps are:
 
 \section{Summary}
 
-DCLAR separates the inspection problem into map routing, local tile coverage, motion representation, mission coordination, and hardware communication. BFS selects a reachable unsearched tile, the coverage planner generates local waypoints, and the motion layer turns consecutive points into pivots and straight drives. The ESP32 bridge forwards one segment at a time, while the desktop waits for a matching robot completion message before advancing.
+DCLAR separates the inspection problem into map routing, local tile coverage, motion representation, mission coordination, and hardware communication. BFS selects a reachable unsearched tile, the coverage planner generates local waypoints, and the motion layer turns consecutive points into pivots and straight drives. The desktop declares each tile transaction, the ESP32 bridge forwards its manifest and one segment at a time, and the GUI marks the tile complete only after the robot returns a matching \texttt{TILE\_DONE}. This confirms the scheduled path ran; physical pose validation still depends on future localization and hardware testing.
 
 The geometry and communication interfaces are in place as a prototype. Physical performance still depends on measured robot parameters, a configured motor driver, localization, sensor validation, and safety testing.
 

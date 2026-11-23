@@ -66,6 +66,24 @@ def make_segment_message(mission_id, sequence, command):
     )
 
 
+def make_mission_start_message(mission_id, row, column, pattern, segment_count):
+    """Declare the complete per-tile path before streaming its segments."""
+    mission_id = str(mission_id).strip()
+    row = int(row)
+    column = int(column)
+    pattern = str(pattern).strip().replace(" ", "_")
+    segment_count = int(segment_count)
+    if not mission_id or "|" in mission_id or "\n" in mission_id:
+        raise ValueError("mission ID must be a non-empty single field")
+    if row < 0 or column < 0 or segment_count < 1:
+        raise ValueError("tile coordinates must be non-negative and path non-empty")
+    if pattern not in ("Zigzag", "Circle_spiral"):
+        raise ValueError("pattern must be Zigzag or Circle spiral")
+    return "MISSION_START|%s|%d|%d|%s|%d" % (
+        mission_id, row, column, pattern, segment_count
+    )
+
+
 def parse_board_line(line):
     """Split a bridge line while preserving the robot message after its prefix."""
     parts = str(line).strip().split("|", 2)
