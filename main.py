@@ -121,6 +121,7 @@ paused = True
 esp32_link = None
 control_window = None
 control_log = None
+serial_log_history = []
 next_task_id = 1
 next_ping_id = 1
 serial_port_map = {}
@@ -146,6 +147,8 @@ hardware_waiting_tile_done = False
 hardware_preflight_token = None
 hardware_preflight_stage = None
 hardware_radio_ready = False
+local_control_ready = False
+local_test_started = False
 usb_link_ready = False
 run_mode = None
 
@@ -209,8 +212,8 @@ ttk.Label(toolbar, text="Run mode:").grid(row=0, column=10, padx=(12, 4))
 run_mode_choice = tk.StringVar(value="Select mode")
 run_mode_menu = ttk.Combobox(
     toolbar, textvariable=run_mode_choice,
-    values=("Simulation", "Robot hardware (ESP-NOW)"),
-    state="readonly", width=23,
+    values=("Simulation", "Robot hardware (ESP-NOW)", "Control-board test (local)"),
+    state="readonly", width=26,
 )
 run_mode_menu.grid(row=0, column=11, padx=(0, 6))
 run_mode_button = ttk.Button(
@@ -1287,6 +1290,11 @@ def reset_search():
             "Hardware pose cannot be reset in software. Reposition and reboot the robot, then restart the app."
         )
         return
+    if run_mode == "local_test" and local_test_started:
+        serial_status_text.set(
+            "Local test pulses have no wheel feedback. Reposition the robot and restart the app to reset its pose."
+        )
+        return
     grid.reset()
     # SearchGrid.reset() clears all obstacles, so restore the standard rack
     # layout immediately afterward. Manually toggled obstacles are reset away.
@@ -1430,16 +1438,18 @@ def send_connection_ping():
 
 
 def start_selected_mode():
-    """Start simulation, or validate both communication hops before hardware."""
+    """Start computer simulation, radio robot mode, or local motor hardware test."""
     global run_mode, paused, hardware_preflight_stage, hardware_preflight_token
-    global next_robot_ping_id, hardware_radio_ready
+    global next_robot_ping_id, hardware_radio_ready, local_control_ready
     selected = run_mode_choice.get()
     if hardware_mission_id is not None:
         serial_status_text.set("Wait for the active robot tile to finish before changing modes")
         return
-    requested_mode = "simulation" if selected == "Simulation" else (
-        "hardware" if selected == "Robot hardware (ESP-NOW)" else None
-    )
+    requested_mode = {
+        "Simulation": "simulation",
+        "Robot hardware (ESP-NOW)": "hardware",
+        "Control-board test (local)": "local_test",
+    }.get(selected)
     if (run_mode is not None and requested_mode != run_mode
             and (grid.order or abs(robot_row - 0.5) > 1e-6
                  or abs(robot_column - 0.5) > 1e-6)):
@@ -1453,6 +1463,7 @@ def start_selected_mode():
         hardware_preflight_token = None
         hardware_preflight_stage = None
         hardware_radio_ready = False
+        local_control_ready = False
         run_mode = "simulation"
         paused = False
         pause_button.configure(text="Pause", state="normal")
@@ -1461,13 +1472,19 @@ def start_selected_mode():
         serial_status_text.set("Simulation active; no robot movement is being commanded")
         redraw()
         return
-    if selected != "Robot hardware (ESP-NOW)":
-        status_text.set("Choose Simulation or Robot hardware, then click Start.")
+    if selected == "Control-board test (local)" and local_test_started:
+        serial_status_text.set(
+            "One local tile test already ran. Reposition the robot, then restart the app before another run."
+        )
         return
-    if fake_robot_mode:
+    if selected not in ("Robot hardware (ESP-NOW)", "Control-board test (local)"):
+        status_text.set("Choose a run mode, then click Start.")
+        return
+    is_local_test = selected == "Control-board test (local)"
+    if fake_robot_mode and not is_local_test:
         serial_status_text.set("Turn off local fake-robot motor mode before robot-path operation")
         return
-    run_mode = "hardware"
+    run_mode = "local_test" if is_local_test else "hardware"
     paused = True
     hardware_radio_ready = False
     pause_button.configure(text="Robot controlled", state="disabled")
@@ -1476,7 +1493,7 @@ def start_selected_mode():
         hardware_preflight_stage = "usb"
         run_mode_button.configure(text="Start", state="normal")
         serial_status_text.set(
-            "Robot mode selected. Click Connect + identify in the USB link below; this Start button does not open the COM port."
+            "Click Connect + identify in the USB link below. This Start button does not open the COM port."
         )
         return
     if not usb_link_ready:
@@ -1485,6 +1502,18 @@ def start_selected_mode():
         serial_status_text.set("Robot mode selected. Waiting for matching USB PING/PONG.")
         if not pending_ping_tokens:
             send_connection_ping()
+        return
+    if is_local_test:
+        if active_motor_test_token is not None:
+            hardware_preflight_stage = None
+            run_mode_button.configure(text="Wait for motor jog", state="normal")
+            serial_status_text.set("Stop or wait for the current motor jog before starting a tile test")
+            return
+        if fake_robot_mode:
+            local_control_ready = True
+            start_hardware_path()
+        else:
+            request_local_control_mode()
         return
     if active_motor_test_token is not None:
         hardware_preflight_stage = None
@@ -1530,8 +1559,38 @@ def request_robot_path_preflight():
     window.after(2500, radio_preflight_timeout)
 
 
+def request_local_control_mode():
+    """Ask the main-control ESP32 to load its local motor driver for one-tile testing."""
+    global hardware_preflight_stage, local_control_ready
+    if esp32_link is None or not usb_link_ready:
+        serial_status_text.set("USB PING/PONG is required before local motor testing")
+        return
+    hardware_preflight_stage = "local_mode"
+    local_control_ready = False
+    if not send_esp32_line("FAKE_ROBOT|ON"):
+        hardware_preflight_stage = None
+        run_mode_button.configure(text="Retry local test", state="normal")
+        return
+    run_mode_button.configure(text="Loading local motor driver…", state="disabled")
+    serial_status_text.set("Waiting for the control board to confirm LOCAL PATH TEST mode.")
+
+    def local_mode_timeout():
+        global hardware_preflight_stage
+        if hardware_preflight_stage == "local_mode" and run_mode == "local_test":
+            hardware_preflight_stage = None
+            run_mode_button.configure(text="Retry local test", state="normal")
+            serial_status_text.set(
+                "No local-mode confirmation. Check main_control_motor_driver.py on the board."
+            )
+
+    window.after(3000, local_mode_timeout)
+
+
 def append_serial_log(message):
     """Append a received/sent serial event to the optional control window."""
+    serial_log_history.append(str(message))
+    if len(serial_log_history) > 300:
+        del serial_log_history[:-300]
     if control_log is None:
         return
     try:
@@ -1563,15 +1622,21 @@ def stop_hardware_mission(message):
     """Clear the queued path after the robot reports an execution error."""
     global hardware_mission_id, hardware_path_commands, hardware_waiting_sequence
     global hardware_waiting_ready, hardware_waiting_tile_done
+    global local_control_ready, hardware_preflight_stage
     if hardware_mission_id is not None and esp32_link is not None:
         send_esp32_line("MISSION_STOP|%s" % hardware_mission_id)
+    if run_mode == "local_test" and fake_robot_mode and esp32_link is not None:
+        hardware_preflight_stage = "local_disable"
+        send_esp32_line("FAKE_ROBOT|OFF")
+        schedule_local_mode_off_timeout()
+        local_control_ready = False
     hardware_mission_id = None
     hardware_path_commands = []
     hardware_waiting_sequence = None
     hardware_waiting_ready = False
     hardware_waiting_tile_done = False
     pause_button.configure(text="Robot controlled", state="disabled")
-    run_mode_button.configure(text="Retry robot mode", state="normal")
+    run_mode_button.configure(text="Retry selected mode", state="normal")
     serial_status_text.set(message)
     append_serial_log(message)
 
@@ -1618,7 +1683,8 @@ def send_next_hardware_segment():
 def finish_hardware_mission():
     """Advance the tile only after the robot confirms the declared path finished."""
     global hardware_mission_id, hardware_path_commands, hardware_waiting_sequence, paused
-    global hardware_waiting_ready, hardware_waiting_tile_done
+    global hardware_waiting_ready, hardware_waiting_tile_done, local_control_ready
+    global hardware_preflight_stage
     finished_cell = grid.target_cell
     if finished_cell is not None:
         completed_path_records.append(
@@ -1633,14 +1699,37 @@ def finish_hardware_mission():
     hardware_waiting_tile_done = False
     paused = True
     pause_button.configure(text="Robot controlled", state="disabled")
-    run_mode_button.configure(text="Robot running", state="disabled")
-    serial_status_text.set("Robot confirmed the tile path; map advanced to the next tile")
-    append_serial_log("Robot TILE_DONE confirmation accepted; marked tile searched")
+    if run_mode == "local_test":
+        run_mode_button.configure(text="Local tile test complete", state="normal")
+        serial_status_text.set(
+            "Control board confirmed the timed tile test; disabling local mode and returning to radio bridge."
+        )
+        append_serial_log("LOCAL TILE_DONE accepted; marked one tile searched")
+        if fake_robot_mode and esp32_link is not None:
+            local_control_ready = False
+            hardware_preflight_stage = "local_disable"
+            send_esp32_line("FAKE_ROBOT|OFF")
+        schedule_local_mode_off_timeout()
+    else:
+        run_mode_button.configure(text="Robot running", state="disabled")
+        serial_status_text.set("Robot confirmed the tile path; map advanced to the next tile")
+        append_serial_log("Robot TILE_DONE confirmation accepted; marked tile searched")
     redraw()
     if run_mode == "hardware" and not grid.complete:
         window.after(400, start_hardware_path)
     elif grid.complete:
         run_mode_button.configure(text="Robot path complete", state="disabled")
+
+
+def schedule_local_mode_off_timeout():
+    """Report when the board does not acknowledge restoration of radio mode."""
+    def local_mode_off_timeout():
+        if hardware_preflight_stage == "local_disable":
+            serial_status_text.set(
+                "No MODE|FAKE_ROBOT|OFF reply. Check the USB link and controller before selecting another mode."
+            )
+            append_serial_log("Local mode-off acknowledgement timed out")
+    window.after(3000, local_mode_off_timeout)
 
 
 def handle_robot_radio_event(line):
@@ -1830,13 +1919,15 @@ def handle_robot_radio_event(line):
 
 
 def start_hardware_path():
-    """Declare the active tile path, then stream segments after robot READY."""
+    """Declare one tile path, then stream after radio or local-mode readiness."""
     global paused
     global hardware_mission_counter, hardware_mission_id
     global hardware_path_commands, hardware_path_index, hardware_waiting_sequence
     global hardware_waiting_ready, hardware_waiting_tile_done
-    if run_mode != "hardware":
-        serial_status_text.set("Select Robot hardware (ESP-NOW) and complete link checks first")
+    global local_test_started
+    is_local_test = run_mode == "local_test"
+    if run_mode not in ("hardware", "local_test"):
+        serial_status_text.set("Select a hardware run mode and complete its link checks first")
         return
     if esp32_link is None:
         serial_status_text.set("Connect to the main-control ESP32 first")
@@ -1844,10 +1935,13 @@ def start_hardware_path():
     if active_motor_test_token is not None:
         serial_status_text.set("Wait for or stop the active motor jog before a planned path")
         return
-    if fake_robot_mode:
+    if is_local_test and not (fake_robot_mode and local_control_ready):
+        serial_status_text.set("The main-control board has not confirmed local motor-test mode")
+        return
+    if not is_local_test and fake_robot_mode:
         serial_status_text.set("Turn off fake-robot mode; it directs motor jogs to the control board")
         return
-    if not hardware_radio_ready:
+    if not is_local_test and not hardware_radio_ready:
         serial_status_text.set("Robot radio validation is required before starting a path")
         return
     if leak_stop_latched:
@@ -1870,8 +1964,14 @@ def start_hardware_path():
     hardware_waiting_ready = True
     hardware_waiting_tile_done = False
     paused = True
-    pause_button.configure(text="STOP robot path", state="normal")
-    run_mode_button.configure(text="Robot executing", state="disabled")
+    local_test_started = local_test_started or is_local_test
+    pause_button.configure(
+        text="STOP local test" if is_local_test else "STOP robot path", state="normal"
+    )
+    run_mode_button.configure(
+        text="Pulsing test motors…" if is_local_test else "Robot executing",
+        state="disabled",
+    )
     redraw()
     append_serial_log(
         "Starting %s with %d segments" % (
@@ -1903,6 +2003,7 @@ def poll_serial_events():
     """Move background serial-reader events onto Tkinter's UI thread."""
     global fake_robot_mode, fake_robot_mode_pending
     global usb_link_ready, hardware_preflight_stage, hardware_radio_ready
+    global local_control_ready
     if esp32_link is not None:
         while True:
             try:
@@ -1915,8 +2016,9 @@ def poll_serial_events():
                 fake_robot_mode_pending = None
                 usb_link_ready = False
                 hardware_radio_ready = False
+                local_control_ready = False
                 if fake_mode_button_text is not None:
-                    fake_mode_button_text.set("Enable fake robot mode")
+                    fake_mode_button_text.set("Enable local motor mode")
                 serial_status_text.set("Connected to %s; board ready" % esp32_link.port)
             elif line.startswith("PONG|"):
                 token = line.split("|", 1)[1]
@@ -1925,24 +2027,52 @@ def poll_serial_events():
                     usb_link_ready = True
                     serial_status_text.set("ESP32 identified; USB ping passed")
                     if hardware_preflight_stage == "usb":
-                        request_robot_path_preflight()
+                        if run_mode == "local_test":
+                            if fake_robot_mode:
+                                local_control_ready = True
+                                start_hardware_path()
+                            else:
+                                request_local_control_mode()
+                        else:
+                            request_robot_path_preflight()
                 else:
                     serial_status_text.set("Unexpected PONG token: %s" % token)
             elif line.startswith("MODE|FAKE_ROBOT|"):
                 fake_robot_mode = line.endswith("|ON")
                 fake_robot_mode_pending = None
+                if run_mode == "local_test" and hardware_preflight_stage == "local_mode" and fake_robot_mode:
+                    local_control_ready = True
+                    hardware_preflight_stage = None
+                    append_serial_log("Control board accepted local path-test mode")
+                    start_hardware_path()
+                elif run_mode == "local_test" and not fake_robot_mode:
+                    local_control_ready = False
+                    if hardware_preflight_stage == "local_disable":
+                        hardware_preflight_stage = None
+                        serial_status_text.set(
+                            "Local tile test finished; main-control ESP32 returned to radio-bridge mode."
+                        )
+                        append_serial_log("Control board returned to radio bridge mode")
                 if fake_mode_button_text is not None:
                     fake_mode_button_text.set(
-                        "Disable fake robot mode" if fake_robot_mode
-                        else "Enable fake robot mode"
+                        "Disable local motor mode" if fake_robot_mode
+                        else "Enable local motor mode"
                     )
                 if motor_test_status_text is not None:
                     motor_test_status_text.set(
-                        "FAKE ROBOT MODE ON: control-board motor outputs are active."
-                        if fake_robot_mode else "Fake robot mode OFF; motor jogs go over ESP-NOW."
+                        "Local motor mode ON: control-board outputs are active."
+                        if fake_robot_mode else "Local motor mode OFF; motor jogs use ESP-NOW."
                     )
             elif line.startswith("ERROR|MOTOR_DRIVER|"):
                 fake_robot_mode_pending = None
+                if run_mode == "local_test":
+                    hardware_preflight_stage = None
+                    local_control_ready = False
+                    run_mode_button.configure(text="Retry local test", state="normal")
+                    serial_status_text.set(
+                        "Local hardware test could not load the motor driver: "
+                        + line.split("|", 2)[2]
+                    )
                 if motor_test_status_text is not None:
                     motor_test_status_text.set("Fake mode failed: %s" % line.split("|", 2)[2])
             elif line.startswith("RX|"):
@@ -2071,7 +2201,7 @@ def open_robot_control():
     motor_frame.grid(row=4, column=0, padx=10, pady=4, sticky="ew")
     ttk.Label(
         motor_frame,
-        text="Enable fake robot mode to run these short motor jogs directly from the control board.",
+        text="Local motor mode routes short jogs to this control board. Control-board test mode also runs a one-tile pulse sequence.",
         wraplength=630,
     ).grid(row=0, column=0, columnspan=5, sticky="w")
     ttk.Label(motor_frame, text="PWM duty (%)").grid(row=1, column=0, pady=(8, 0), sticky="w")
@@ -2113,12 +2243,12 @@ def open_robot_control():
             window.after(1500, radio_ping_timeout)
 
     fake_mode_button_text = tk.StringVar(value=(
-        "Disable fake robot mode" if fake_robot_mode else "Enable fake robot mode"
+        "Disable local motor mode" if fake_robot_mode else "Enable local motor mode"
     ))
 
     def toggle_fake_robot_mode():
         global fake_robot_mode_pending
-        if hardware_mission_id is not None or run_mode == "hardware":
+        if hardware_mission_id is not None or run_mode in ("hardware", "local_test"):
             motor_test_status_text.set("Leave Robot hardware mode before changing the local motor-test mode.")
             return
         if esp32_link is None:
@@ -2183,7 +2313,7 @@ def open_robot_control():
                 motor_test_status_text.set("Connect to the main-control ESP32 first.")
             return
         if fake_robot_mode_pending is not None:
-            motor_test_status_text.set("Wait for fake robot mode confirmation before jogging.")
+            motor_test_status_text.set("Wait for local motor mode confirmation before jogging.")
             return
         if hardware_mission_id is not None:
             motor_test_status_text.set("Stop or finish the planned path before a motor jog.")
@@ -2300,6 +2430,11 @@ def open_robot_control():
     control_window.columnconfigure(0, weight=1)
     control_log = tk.Text(log_frame, height=9, width=68, state="disabled", wrap="word")
     control_log.grid(row=0, column=0, sticky="nsew")
+    control_log.configure(state="normal")
+    for previous_line in serial_log_history:
+        control_log.insert("end", previous_line + "\n")
+    control_log.see("end")
+    control_log.configure(state="disabled")
     log_frame.rowconfigure(0, weight=1)
     log_frame.columnconfigure(0, weight=1)
     if esp32_link is None:
@@ -2330,6 +2465,8 @@ def close_main_window():
     if esp32_link is not None:
         if hardware_mission_id is not None:
             send_esp32_line("MISSION_STOP|%s" % hardware_mission_id)
+        if run_mode == "local_test" and fake_robot_mode:
+            send_esp32_line("FAKE_ROBOT|OFF")
         if active_motor_test_token is not None:
             send_esp32_line(make_motor_stop_message(active_motor_test_token))
         esp32_link.close()
@@ -2342,7 +2479,7 @@ window.protocol("WM_DELETE_WINDOW", close_main_window)
 refresh_serial_ports()
 window.after(2000, monitor_serial_port_changes)
 choose_next_target()
-status_text.set("Choose Simulation or Robot hardware, then click Start. Motion is paused.")
+status_text.set("Choose Simulation, Robot hardware, or Control-board test; then click Start.")
 redraw()
 # after(ms, callback) queues the first animation frame 25 ms from now.
 main_after_id = window.after(FRAME_MS, update_search)

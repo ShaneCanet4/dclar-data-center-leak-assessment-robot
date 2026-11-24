@@ -30,8 +30,9 @@ The desktop `main.py` starts paused and asks the operator to select a run mode.
 requires a matching USB PING/PONG and robot radio PONG before declaring a tile
 path. The desktop sends a tile manifest, streams one segment at a time, and
 marks the tile searched only after the matching robot `TILE_DONE` confirmation.
-The separate **fake robot mode** in the jog panel means local motor-driver GPIO
-testing on the main-control Feather; it is not a simulated map run.
+The jog panel's local motor mode sends short jog commands to the main-control Feather. The third run mode, **Control-board test (local)**, exercises a complete one-tile UI transaction on that same board without the robot ESP32 or ESP-NOW. After USB PING/PONG, the app requests `FAKE_ROBOT|ON`, waits for `MODE|FAKE_ROBOT|ON`, sends `MISSION_START` and one `SEG` at a time, then waits for `TILE_DONE` before marking that tile searched. The board executes each segment as short 30% duty motor pulses and returns `MISSION_READY`, `RECEIVED`, `DONE`, and `TILE_DONE` over USB. The app then sends `FAKE_ROBOT|OFF` and waits for its acknowledgement before reporting radio-bridge mode. The serial activity log shows each request and reply.
+
+This is a bounded signal and UI integration test, not calibrated travel: each turn/drive segment is capped at 500 ms, and a timer can confirm completion even if a motor only buzzes or stalls. The map advances on the matching final token by design; visually inspect the motors separately. This mode runs only one tile per app session. For this mode, copy `esp32/main_control_motor_driver.py` and `esp32/motor_test_protocol.py` to the main-control board root in addition to the normal bridge and display modules.
 
 ### Configure and run
 
@@ -240,13 +241,13 @@ The last two display modules are upstream dependencies; keep local copies in
 robot's `esp32/motor_driver.py`, `esp32/robot_motion.py`, and
 `esp32/esp32_robot_control.py` are not used in this mode.
 
-In the desktop control window, click **Enable fake robot mode**. Wait for the
+In the desktop control window, click **Enable local motor mode**. Wait for the
 board display to show **FAKE ROBOT ON** and the app to report that the
 control-board motor outputs are active. That acknowledgement means the local
 driver module loaded and fake mode is enabled; the desktop then routes the
 existing bounded Forward/Reverse/Pivot/Motor A/B/STOP jog commands to the
 control board's own GPIO pins. Fake mode resets to OFF whenever the board
-restarts. Click **Disable fake robot mode** to return motor jogs to the normal
+restarts. Click **Disable local motor mode** to return motor jogs to the normal
 ESP-NOW robot path.
 
 Wire the motor driver to Feather GPIO5/GPIO6 (Motor A direction),

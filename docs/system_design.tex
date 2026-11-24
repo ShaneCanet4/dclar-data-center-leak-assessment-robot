@@ -52,7 +52,7 @@ This is the living system-architecture document for DCLAR. It describes the desi
 
 \subsection{Design ownership and AI-assisted development}
 
-The student is the system designer and engineering decision-maker. The student supplied the project goal and requirements, chose the mechanical and system-level constraints, described desired behavior, reviewed results, and directed revisions. Examples of student-led decisions include separating map routing from tile coverage, using the stated robot footprint to set nominal coverage spacing, selecting a desktop-to-ESP32 communication path, and requesting capabilities such as debugging USB communication, sending planned motion segments, and adding interface features. The local fake-robot mode was also a student-directed feature: it provides a way to bench-check basic motor outputs from the main-control board when the separate robot board is unavailable.
+The student is the system designer and engineering decision-maker. The student supplied the project goal and requirements, chose the mechanical and system-level constraints, described desired behavior, reviewed results, and directed revisions. Examples of student-led decisions include separating map routing from tile coverage, using the stated robot footprint to set nominal coverage spacing, selecting a desktop-to-ESP32 communication path, and requesting capabilities such as debugging USB communication, sending planned motion segments, and adding interface features. The local motor-jog mode and Control-board test (local) run mode were student-directed features: they provide a way to bench-check motor outputs and demonstrate the full tile-confirmation UI from the main-control board when the separate robot board is unavailable.
 
 AI served as an implementation assistant in a role similar to a junior software engineer working from a mechanical engineer's requirements. The student translated engineering needs into software direction; AI helped turn that direction into code and documentation, refined interfaces, and iterated on issues identified during review. For example, the student directed the use of PySerial for the computer-to-board connection, pipe-delimited text packets built with Python f-strings, and an ESP32-to-ESP32 ESP-NOW bridge. AI assistance helped implement and debug those paths and add supporting controls and protocol behavior. The student remains responsible for the design choices, checking that the implementation matches the intended robot, and validating it against measured hardware. AI-generated code or calculations are not evidence of calibration or physical validation.
 
@@ -80,7 +80,7 @@ This attribution describes the development process for the current prototype, no
 
 The Data Center Leak Assessment Robot (DCLAR) is a software prototype for planning a small robot's search through a gridded data-center floor. The program models server racks as blocked floor tiles, chooses a reachable tile to inspect, generates a coverage pattern inside that tile, and converts the resulting waypoints into pivot-and-drive motion segments.
 
-The desktop application is mainly a planning and visualization tool. It shows the route, animates the planned movement, allows spill locations to be annotated, and saves a JSON snapshot. It also connects over USB to a main-control ESP32. That board normally bridges messages to a second ESP32 over ESP-NOW, but it can enter an explicitly selected fake-robot mode and drive a motor driver connected to its own GPIO pins for short bench jogs. In either mode, the desktop sends commands; the ESP32 firmware generates the motor outputs. The system does not currently include a physical leak sensor or validated autonomous motion.
+The desktop application is mainly a planning and visualization tool. It shows the route, animates the planned movement, allows spill locations to be annotated, and saves a JSON snapshot. It also connects over USB to a main-control ESP32. That board normally bridges messages to a second ESP32 over ESP-NOW, but it also supports local motor jogs and a one-tile Control-board test (local) run mode that drives a motor driver connected to its own GPIO pins. In either mode, the desktop sends commands; the ESP32 firmware generates the motor outputs. The system does not currently include a physical leak sensor or validated autonomous motion.
 
 The main design idea is to keep the problem separated into smaller pieces. The route planner decides which tile to visit. The coverage planner decides where the robot should move inside that tile. The motion representation converts points into a sequence of turns and straight drives. In hardware mode, the desktop declares the expected tile path and sends one segment at a time; the GUI waits for the robot's matching tile-completion reply before marking the square searched.
 
@@ -120,7 +120,7 @@ $\downarrow$ \small{ESP-NOW wireless messages over a shared Wi-Fi channel}
 \vspace{5pt}
 \end{minipage}
 }
-\caption{DCLAR software and hardware communication architecture. Run mode is explicitly selected: computer-only simulation or robot hardware. Hardware missions use a tile manifest, sequential segments, and a final robot tile-completion reply. Fake-robot mode is a separate local motor-jog bench feature.}
+\caption{DCLAR software and hardware communication architecture. Run mode is explicitly selected: computer-only simulation, robot hardware over ESP-NOW, or a one-tile local control-board test. Hardware missions use a tile manifest, sequential segments, and a final tile-completion reply.}
 \end{figure}
 
 \section{Subsystem Breakdown}
@@ -135,7 +135,7 @@ Map routing & \texttt{route.py} & Represents rack cells as obstacles and uses BF
 Tile coverage & \texttt{search.py} & Generates ordered zigzag or circle-spiral waypoints for one tile.\\
 USB communication & \texttt{serial\_link.py}, \texttt{serial\_protocol.py} & Finds serial ports, opens the desktop-to-ESP32 connection, and formats messages.\\
 Motor-test protocol & \texttt{esp32/motor\_test\_protocol.py} & Defines bounded motor-test and stop messages shared by the desktop and both firmware targets.\\
-Radio bridge and local mode & \texttt{esp32/esp32\_main\_control.py} & Receives USB serial lines, forwards commands over ESP-NOW in normal mode, and locally handles bounded motor jogs in fake-robot mode.\\
+Radio bridge and local mode & \texttt{esp32/esp32\_main\_control.py} & Receives USB serial lines, forwards commands over ESP-NOW in normal mode, and locally handles bounded motor jogs and the Control-board test (local) path transaction.\\
 Robot receiver & \texttt{esp32/esp32\_robot\_control.py} & Validates tile manifests, schedules bounded pivot/drive timing, and reports segment and tile completion.\\
 Motion conversion & \texttt{esp32/robot\_motion.py} & Provides differential-drive geometry helpers for offline calculations; the current firmware path uses measured open-loop speed and turn-rate values.\\
 Robot-board motor output & \texttt{esp32/motor\_driver.py} & Sets direction and capped PWM for radio-requested manual jogs using the robot board's configured GPIO mapping.\\
@@ -299,7 +299,7 @@ The desktop connects to the main-control ESP32 over USB serial. In normal mode, 
 
 \subsection{Explicit Run Mode and Startup Validation}
 
-The desktop starts with motion paused and requires an explicit run-mode selection. \textbf{Simulation} animates the map on the computer; it does not send a movement path to either ESP32. \textbf{Robot hardware (ESP-NOW)} disables that animation and leaves the map's tile-completion state unchanged until the robot returns a matching completion confirmation. The application also has a separate \textbf{fake-robot motor-jog mode}: despite its name, that mode drives real GPIO outputs on the main-control Feather for short bench tests. It is not the computer-only simulation and it is not the robot-path mode.
+The desktop starts with motion paused and requires an explicit run-mode selection. \textbf{Simulation} animates the map on the computer; it does not send a movement path to either ESP32. \textbf{Robot hardware (ESP-NOW)} disables that animation and leaves the map's tile-completion state unchanged until the robot returns a matching completion confirmation. The application also has a third \textbf{Control-board test (local)} mode that runs a one-tile timed motor sequence on the USB-connected main-control Feather, then waits for the completion token before advancing the map. It drives real GPIO outputs and is not a simulation; its timed confirmation does not prove physical motion.
 
 Robot hardware startup validates both communication hops before starting a tile:
 \begin{enumerate}
@@ -351,7 +351,7 @@ The reply forms are \texttt{MOTOR\_TEST\_STARTED|test\_id|duration\_ms}, \texttt
 
 \subsection{Main-Control Fake-Robot Mode}
 
-The GUI's \textbf{Enable fake robot mode} button sends \texttt{FAKE\_ROBOT|ON} over USB. Fake mode starts OFF after every board reset. Before confirming ON, the main-control firmware imports \texttt{main\_control\_motor\_driver.py} and disables its outputs. Only after that setup succeeds does it return \texttt{MODE|FAKE\_ROBOT|ON}; the TFT keeps \textbf{FAKE ROBOT ON} visible while the mode is active. If the driver cannot load, the board reports an error and does not confirm the mode. Disabling the mode stops local outputs and restores the normal radio path for motor-test messages.
+The jog panel's \textbf{Enable local motor mode} button sends \texttt{FAKE\_ROBOT|ON} over USB. Fake mode starts OFF after every board reset. Before confirming ON, the main-control firmware imports \texttt{main\_control\_motor\_driver.py} and disables its outputs. Only after that setup succeeds does it return \texttt{MODE|FAKE\_ROBOT|ON}; the TFT keeps \textbf{FAKE ROBOT ON} visible while the mode is active. If the driver cannot load, the board reports an error and does not confirm the mode. Disabling the mode stops local outputs and restores the normal radio path for motor-test messages.
 
 In fake mode, the existing Forward, Reverse, Pivot, Motor A-only, Motor B-only, and STOP controls send the same bounded motor-test protocol, but the main-control board executes those commands directly. Its Feather-specific mapping is GPIO5/GPIO6 for Motor A direction, GPIO9/GPIO10 for Motor B direction, and GPIO11/GPIO12 for ENA/ENB PWM. These correspond to header pins D5, D6, D9, D10, D11, and D12 on the Adafruit ESP32-S3 TFT Feather. The robot-board driver uses this same map so two matching Feather boards can share motor-driver wiring. Do not use these pin assignments on a classic ESP32 board, where several are reserved for flash or unavailable. Check the exact board revision and motor-driver wiring before applying power.
 
@@ -362,6 +362,22 @@ For example, \texttt{MOTOR\_TEST|J0001|1|1|19660|400} asks for a 400 ms forward 
 A \texttt{TX} message from the bridge only indicates that the radio send succeeded at the communication layer. \texttt{MISSION\_READY} confirms manifest acceptance; \texttt{RECEIVED} confirms segment acceptance; \texttt{DONE} confirms that segment's scheduled motor time elapsed; and only a matching \texttt{TILE\_DONE} allows the desktop to mark the tile searched. None of these messages measures physical position. The bridge relays messages but does not own the mission state.
 
 The USB connection can be checked separately using \texttt{PING} and \texttt{PONG}. The GUI uses request tokens such as \texttt{GUI0022} or \texttt{APP0001}; the ESP32 returns the same token. This checks the computer-to-bridge serial connection and does not require the robot to move. The motor-test panel's \textbf{Ping robot radio} sends \texttt{RADIO\_PING|token}; a matching \texttt{RADIO\_PONG|token} confirms a round trip through the configured robot ESP32.
+
+\subsection{Control-Board Test (Local) Run Mode}
+
+The desktop offers a third run mode, \textbf{Control-board test (local)}, for demonstrating the complete planned-tile transaction with only the USB-connected main-control Feather and its wired motor driver. It does not use the robot ESP32 or ESP-NOW. This mode is separate from \textbf{Simulation}, which moves only the computer display, and from \textbf{Robot hardware (ESP-NOW)}, which requires the radio receiver and calibrated robot motion. The app limits this local test to one tile per session.
+
+The startup handshake first requires the normal token-matched USB \texttt{PING}/\texttt{PONG}. The desktop then sends \texttt{FAKE\_ROBOT|ON}; the board imports its local motor driver, stops its outputs, and replies \texttt{MODE|FAKE\_ROBOT|ON}. Only after that acknowledgement does the desktop send the manifest \texttt{MISSION\_START|mission\_id|row|column|pattern|segment\_count}. The board replies \texttt{RX|LOCAL|MISSION\_READY|mission\_id|segment\_count}. The desktop sends one planned segment at a time:
+
+\begin{lstlisting}
+SEG|mission_id|sequence|pivot_degrees|distance_ft|target_x_ft|target_y_ft|heading_degrees
+\end{lstlisting}
+
+For each accepted segment, the board replies \texttt{RX|LOCAL|RECEIVED|mission\_id|sequence}, runs a bounded local pulse for the pivot and/or drive part, and then replies \texttt{RX|LOCAL|DONE|mission\_id|sequence|x|y|heading}. Once the declared final segment reaches its timer completion and its endpoint matches the manifest tile center, the board sends \texttt{RX|LOCAL|TILE\_DONE|mission\_id|row|column|segment\_count}. The app validates the mission, sequence, target, and count before advancing the map. Its serial activity log displays every USB command and board reply. After this one tile, the app sends \texttt{FAKE\_ROBOT|OFF}; the board stops outputs, replies \texttt{MODE|FAKE\_ROBOT|OFF}, and resumes radio-bridge routing. The UI reports a timeout if this final acknowledgement does not arrive.
+
+Local pulses use a fixed 30 percent PWM duty and duration proportional to the requested angle or distance, clamped to 60--500 ms per turn or drive part. These deliberately uncalibrated pulses exist to exercise command routing, motor outputs, token sequencing, and map confirmation. \texttt{DONE} and \texttt{TILE\_DONE} confirm that the scheduled timers elapsed and the firmware accepted the declared endpoint; they do not sense rotation or travel. The UI can therefore advance the tile even if a wheel only buzzes, stalls, or is mechanically blocked. Treat that outcome as a successful protocol/UI demonstration and a failed physical-motion check. Check actual motor movement independently. The local test does not establish wheel calibration, localization, leak sensing, obstacle detection, or safe floor operation.
+
+To run it, deploy \texttt{esp32/esp32\_main\_control.py} as the board's \texttt{/main.py}, plus \texttt{board\_display.py}, \texttt{main\_control\_motor\_driver.py}, \texttt{motor\_test\_protocol.py}, \texttt{st7789py.py}, and \texttt{vga1\_16x32.py} to the device root. Connect the board in the desktop app, wait for USB identification, select the local test mode, and click Start. For initial motor-power checks, lift the drive wheels and retain access to the physical supply disconnect. If the segment log completes but the motors buzz without turning, the confirmation shows the software schedule ran; it does not diagnose or correct the driver's power, wiring, or mechanical load.
 
 \subsection{Hardware Requirements Before Motion}
 
@@ -435,7 +451,7 @@ Save \texttt{esp32\_main\_control.py} on the device as \texttt{/main.py} so it s
 
 The display configuration in the firmware uses the Feather ESP32-S3 TFT pin assignments: power GPIO21, CS GPIO7, DC GPIO39, reset GPIO40, backlight GPIO45, and SPI SCK/MOSI GPIO36/GPIO35. These are firmware configuration details and should be checked against the actual board before wiring.
 
-To enable local fake-robot motor testing, also copy \texttt{esp32/main\_control\_motor\_driver.py} and \texttt{esp32/motor\_test\_protocol.py} to the main-control device root. The complete root-file set is therefore \texttt{/main.py}, \texttt{/board\_display.py}, \texttt{/main\_control\_motor\_driver.py}, \texttt{/motor\_test\_protocol.py}, \texttt{/st7789py.py}, and \texttt{/vga1\_16x32.py}. The last two source files are downloaded from upstream into the computer's \texttt{esp32/} folder; all project-owned MicroPython source is grouped there as well. The Feather-specific motor driver is imported only when the GUI requests fake mode. A main-control-only motor test needs this board, the desktop app, and a correctly wired motor driver; it does not need the robot ESP32. The normal radio bridge still needs a configured robot MAC when radio operation is intended.
+To enable local fake-robot motor testing, also copy \texttt{esp32/main\_control\_motor\_driver.py} and \texttt{esp32/motor\_test\_protocol.py} to the main-control device root. The complete root-file set is therefore \texttt{/main.py}, \texttt{/board\_display.py}, \texttt{/main\_control\_motor\_driver.py}, \texttt{/motor\_test\_protocol.py}, \texttt{/st7789py.py}, and \texttt{/vga1\_16x32.py}. The last two source files are downloaded from upstream into the computer's \texttt{esp32/} folder; all project-owned MicroPython source is grouped there as well. The Feather-specific motor driver is imported only when the GUI requests fake mode. The jog panel local motor mode and the Control-board test (local) run mode need this board, the desktop app, and a correctly wired motor driver; they do not need the robot ESP32. The normal radio bridge still needs a configured robot MAC when radio operation is intended.
 
 \subsection{Robot ESP32 Setup}
 
@@ -472,6 +488,10 @@ The fields are task ID, target $x$ and $y$ in feet, heading in degrees (or \text
 
 The same window has a bounded robot motor-jog panel. Select PWM duty (1--75 percent) and pulse duration (100--1500 ms), then send forward, reverse, pivot-left, pivot-right, Motor A-only, or Motor B-only packets. Replies appear in the serial log. A completed packet is evidence that the ESP32 accepted and timed the command; visually confirm wheel movement. These tests do not measure speed, distance, or motor health.
 
+\paragraph{Local tile protocol demonstration}
+
+For a complete UI-to-local-motor protocol demonstration, select \textbf{Control-board test (local)} in the main window after USB identification and click Start. Confirm the local-mode ON acknowledgement, then inspect the control window's serial log for the manifest, each sequential \texttt{RECEIVED}/\texttt{DONE} pair, final \texttt{TILE\_DONE}, and mode OFF acknowledgement. Confirm that the map marks only the confirmed target tile and displays the following target. The test pulses real outputs at bounded 30 percent duty; keep the wheels raised and disconnect motor power if the driver or motors behave unexpectedly. Buzzing without rotation is a failed physical-motion check even when the full token sequence and UI update succeed.
+
 \subsection{Testing Order}
 
 The local fake-robot option makes the command path shorter, but it does not make the output simulated: GPIO pins on the Feather control real driver inputs. Testing should therefore move from communication and mode checks to low-energy, wheel-off-ground motor checks. Keep software evidence, firmware state, and observed hardware behavior separate in the test record.
@@ -479,7 +499,7 @@ The local fake-robot option makes the command path shorter, but it does not make
 For the main-control board's local mode, use this sequence:
 \begin{enumerate}
     \item Connect the main-control Feather to the desktop over USB, close Thonny's serial session, and confirm the desktop's tokenized PING/PONG check succeeds.
-    \item In the robot-control window, request \textbf{Enable fake robot mode}. Continue only after the desktop receives \texttt{MODE|FAKE\_ROBOT|ON} and the TFT visibly shows \textbf{FAKE ROBOT ON}. The confirmation establishes mode selection and driver-module initialization; it does not establish that a motor is wired correctly.
+    \item In the robot-control window, request \textbf{Enable local motor mode}. Continue only after the desktop receives \texttt{MODE|FAKE\_ROBOT|ON} and the TFT visibly shows \textbf{FAKE ROBOT ON}. The confirmation establishes mode selection and driver-module initialization; it does not establish that a motor is wired correctly.
     \item With motor power disconnected, inspect the GPIO-to-driver mapping, remove ENA/ENB jumpers, confirm common ground, check the motor supply polarity and ratings, and make sure the drive wheels are raised clear of the bench.
     \item Reconnect a suitable motor supply and send a short Motor A-only jog, followed by Motor B-only. Begin at low duty and the minimum 100 ms duration. Confirm the intended wheel turns, then record its direction. Increase duty only as needed and stay within the firmware's 75 percent and 1500 ms limits.
     \item Verify Forward, Reverse, Pivot left, and Pivot right only after each channel has been checked individually. If a direction is reversed, correct the matching driver's inversion setting and repeat the individual-channel check.
