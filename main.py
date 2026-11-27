@@ -1737,7 +1737,7 @@ def handle_robot_radio_event(line):
     global hardware_path_index, robot_row, robot_column, robot_heading
     global active_motor_test_token
     global hardware_radio_ready, hardware_preflight_stage, hardware_preflight_token
-    global hardware_waiting_ready, hardware_waiting_tile_done
+    global hardware_waiting_sequence, hardware_waiting_ready, hardware_waiting_tile_done
     fields = line.split("|", 2)
     if len(fields) < 3 or fields[0] != "RX":
         return
